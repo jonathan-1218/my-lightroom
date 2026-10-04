@@ -63,6 +63,7 @@ fun Context.textButton(label: String, onClick: () -> Unit) = Ui.type(TextView(th
         intArrayOf(Ui.color("text-muted"), Ui.color("text"))))
     background = Ui.ripple(null)
     isClickable = true
+    isFocusable = true // keyboard / d-pad reachable; the ripple draws the focus highlight
     setOnClickListener { onClick() }
 }
 
@@ -75,6 +76,7 @@ class Tabs(ctx: Context, names: List<String>, private val onSelect: (Int) -> Uni
             minHeight = Ui.dp(36)
             setPadding(Ui.space(4), 0, Ui.space(4), 0)
             isClickable = true
+            isFocusable = true
         }
     }
 
@@ -101,7 +103,7 @@ class Tabs(ctx: Context, names: List<String>, private val onSelect: (Int) -> Uni
 }
 
 /** Lightroom-style slider: name left, signed value right, -100..100, tap the name to reset. */
-class SliderRow(ctx: Context, name: String, onChange: (Int) -> Unit) : LinearLayout(ctx) {
+class SliderRow(ctx: Context, name: String, onStart: () -> Unit = {}, onChange: (Int) -> Unit) : LinearLayout(ctx) {
     private val title = name.replaceFirstChar { it.uppercase() }
     private val value = Ui.type(TextView(ctx), "sm", "text-muted").apply { fontFeatureSettings = "tnum" }
     val bar = SeekBar(ctx).apply {
@@ -118,8 +120,9 @@ class SliderRow(ctx: Context, name: String, onChange: (Int) -> Unit) : LinearLay
         val label = Ui.type(TextView(ctx), "sm").apply {
             text = title
             isClickable = true
+            isFocusable = true
             contentDescription = "$title, tap to reset"
-            setOnClickListener { bar.progress = 0 }
+            setOnClickListener { if (bar.progress != 0) { onStart(); bar.progress = 0 } }
         }
         addView(LinearLayout(ctx).apply {
             addView(label, LayoutParams(0, -2, 1f))
@@ -133,7 +136,7 @@ class SliderRow(ctx: Context, name: String, onChange: (Int) -> Unit) : LinearLay
         }
         bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { show(p); onChange(p) }
-            override fun onStartTrackingTouch(s: SeekBar) {}
+            override fun onStartTrackingTouch(s: SeekBar) = onStart() // one undo step per drag
             override fun onStopTrackingTouch(s: SeekBar) {}
         })
         show(0)

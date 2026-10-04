@@ -14,6 +14,7 @@ import android.graphics.Paint
 import android.graphics.Picture
 import android.graphics.RuntimeShader
 import android.graphics.Shader
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -102,6 +103,15 @@ class EditView(ctx: Context) : View(ctx) {
     }
 }
 
+private val EXIF_TAGS = listOf(
+    ExifInterface.TAG_DATETIME, ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_DATETIME_DIGITIZED, ExifInterface.TAG_OFFSET_TIME_ORIGINAL,
+    ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL, "LensMake", "LensModel", // framework ExifInterface has no constants for these
+    ExifInterface.TAG_F_NUMBER, ExifInterface.TAG_EXPOSURE_TIME, ExifInterface.TAG_ISO_SPEED_RATINGS,
+    ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, ExifInterface.TAG_FLASH,
+    ExifInterface.TAG_WHITE_BALANCE, ExifInterface.TAG_ARTIST, ExifInterface.TAG_COPYRIGHT,
+)
+
+/** S02 editor. */
 class MainActivity : Activity() {
     private lateinit var edit: EditView
     private var full: Bitmap? = null
@@ -110,6 +120,12 @@ class MainActivity : Activity() {
     private var photoId: Long? = null
     private val ui = Handler(Looper.getMainLooper())
     private val saveEdit = Runnable { photoId?.let { db.saveEdit(it, toJson(edit.v)) } }
+    private var source: Uri? = null
+    // ponytail: in-memory history, lost when the editor closes; Versions (S07) cover keeping states
+    private val undo = ArrayDeque<FloatArray>()
+    private val redo = ArrayDeque<FloatArray>()
+    private lateinit var undoBtn: View
+    private lateinit var redoBtn: View
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -122,9 +138,11 @@ class MainActivity : Activity() {
             setBackgroundColor(Ui.color("surface"))
             gravity = android.view.Gravity.CENTER_VERTICAL
             setPadding(Ui.space(2), 0, Ui.space(2), 0)
-            addView(textButton("Open") { startActivityForResult(Intent(MediaStore.ACTION_PICK_IMAGES).setType("image/*"), 1) })
+            addView(textButton("Photos") { photos() })
             addView(View(context), LayoutParams(0, 0, 1f))
-            addView(textButton("Reset") { bars.forEach { it.progress = 0 } })
+            undoBtn = textButton("Undo") { step(undo, redo) }.also { addView(it) }
+            redoBtn = textButton("Redo") { step(redo, undo) }.also { addView(it) }
+            addView(textButton("Reset") { if (edit.v.any { it != 0f }) { checkpoint(); bars.forEach { it.progress = 0 } } })
             addView(textButton("Export") { save() })
         }
 
@@ -134,7 +152,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 names.forEach { name ->
                     val i = SLIDERS.indexOf(name)
-                    val row = SliderRow(context, name) { p ->
+                    val row = SliderRow(context, name, ::checkpoint) { p ->
                         edit.v[i] = p / 100f; edit.invalidate()
                         ui.removeCallbacks(saveEdit); ui.postDelayed(saveEdit, 300) // autosave, debounced
                     }
@@ -162,6 +180,7 @@ class MainActivity : Activity() {
             fitInsets()
         }
         setContentView(root)
+        syncHistory()
         // Opened from the gallery via "Edit with" / "Share" / "Open with".
         (intent.data ?: intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))?.let(::load)
     }
@@ -171,9 +190,34 @@ class MainActivity : Activity() {
         v.setPadding(b.left, b.top, b.right, b.bottom); ins
     }
 
-    @Deprecated("plain Activity, no AndroidX")
-    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
-        if (res == RESULT_OK) data?.data?.let(::load)
+    /** Back to the library; opened from another app there is no library underneath, so start one. */
+    private fun photos() {
+        if (isTaskRoot) startActivity(Intent(this, LibraryActivity::class.java))
+        finish()
+    }
+
+    private fun checkpoint() {
+        undo.addLast(edit.v.copyOf())
+        if (undo.size > 100) undo.removeFirst()
+        redo.clear()
+        syncHistory()
+    }
+
+    private fun step(from: ArrayDeque<FloatArray>, to: ArrayDeque<FloatArray>) {
+        val state = from.removeLastOrNull() ?: return
+        to.addLast(edit.v.copyOf())
+        state.forEachIndexed { i, x -> bars[i].progress = Math.round(x * 100) }
+        syncHistory()
+    }
+
+    private fun syncHistory() { undoBtn.isEnabled = undo.isNotEmpty(); redoBtn.isEnabled = redo.isNotEmpty() }
+
+    // Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y with a keyboard attached.
+    override fun onKeyShortcut(code: Int, e: android.view.KeyEvent): Boolean = when {
+        code == android.view.KeyEvent.KEYCODE_Z && e.isShiftPressed -> { step(redo, undo); true }
+        code == android.view.KeyEvent.KEYCODE_Z -> { step(undo, redo); true }
+        code == android.view.KeyEvent.KEYCODE_Y -> { step(redo, undo); true }
+        else -> super.onKeyShortcut(code, e)
     }
 
     private fun load(uri: Uri) = Thread {
@@ -192,6 +236,8 @@ class MainActivity : Activity() {
             photoId = null // don't write the previous photo's sliders onto this one
             fromJson(saved).forEachIndexed { i, x -> bars[i].progress = Math.round(x * 100) }
             photoId = id
+            source = uri
+            undo.clear(); redo.clear(); syncHistory()
             val k = 1600f / maxOf(bmp.width, bmp.height) // small copy keeps slider dragging smooth
             full = bmp
             edit.src = if (k < 1) Bitmap.createScaledBitmap(bmp, (bmp.width * k).toInt(), (bmp.height * k).toInt(), true) else bmp
@@ -213,12 +259,29 @@ class MainActivity : Activity() {
                 put(MediaStore.Images.Media.DISPLAY_NAME, "Lumen_${System.currentTimeMillis()}.jpg")
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Lumen")
+                put(MediaStore.Images.Media.IS_PENDING, 1) // hidden from other apps until EXIF is written
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             val ok = uri != null && contentResolver.openOutputStream(uri)
-                ?.use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) } == true
-            runOnUiThread { toast(if (ok) "Saved to Pictures/Lumen" else "Save failed") }
+                ?.use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) } == true &&
+                runCatching { copyExif(source, uri) }.onFailure { Log.w("Lumen", "exif", it) }.isSuccess
+            if (uri != null) contentResolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+            runOnUiThread { toast(if (ok) "Exported to Pictures/Lumen" else "Export failed") }
         }.start()
+    }
+
+    /** Camera and date metadata survive export. Orientation is baked into the pixels, so it resets to normal. */
+    private fun copyExif(from: Uri?, to: Uri) {
+        val src = from?.let { u -> contentResolver.openInputStream(u)?.use { ExifInterface(it) } }
+        contentResolver.openFileDescriptor(to, "rw")!!.use { fd ->
+            ExifInterface(fd.fileDescriptor).apply {
+                // ponytail: no GPS. MediaStore redacts location unless ACCESS_MEDIA_LOCATION is granted; add both if exports should keep it
+                EXIF_TAGS.forEach { t -> src?.getAttribute(t)?.let { setAttribute(t, it) } }
+                setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+                setAttribute(ExifInterface.TAG_SOFTWARE, "Lumen")
+                saveAttributes()
+            }
+        }
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()

@@ -1,8 +1,8 @@
 feature,area,priority,original,clone,notes
 Open photo from picker or gallery Edit-with,import,must,yes,yes,
-Browse device photos in a grid,library,must,yes,no,MediaStore + READ_MEDIA_IMAGES
+Browse device photos in a grid,library,must,yes,yes,full + Android 14 partial access; newest first
 Edits saved per photo (non-destructive),library,must,yes,yes,SQLite row per photo keyed by name+size; autosave 300 ms
-Undo / redo history,edit,must,yes,no,
+Undo / redo history,edit,must,yes,yes,in memory per editing session; Ctrl+Z / Ctrl+Shift+Z
 Before / after,edit,must,yes,yes,press and hold
 Exposure contrast highlights shadows whites blacks,light,must,yes,yes,
 Temp tint vibrance saturation,color,must,yes,yes,
@@ -41,7 +41,7 @@ Albums,library,should,yes,no,
 Filter and search by rating/flag/date,library,should,yes,no,
 Export JPEG with quality and size,export,must,yes,partial,JPEG 95 only today
 Export PNG / TIFF / original,export,should,yes,no,framework encodes PNG; TIFF needs a writer
-Keep EXIF on export,export,must,yes,no,android.media.ExifInterface
+Keep EXIF on export,export,must,yes,partial,dates camera lens exposure copied; GPS dropped (needs ACCESS_MEDIA_LOCATION)
 Full-resolution export beyond 4096px,export,must,yes,no,tiled render
 Watermark,export,could,yes,no,
 Share to other apps,export,should,yes,no,
