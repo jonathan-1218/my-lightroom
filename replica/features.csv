@@ -1,0 +1,58 @@
+feature,area,priority,original,clone,notes
+Open photo from picker or gallery Edit-with,import,must,yes,yes,
+Browse device photos in a grid,library,must,yes,no,MediaStore + READ_MEDIA_IMAGES
+Edits saved per photo (non-destructive),library,must,yes,yes,SQLite row per photo keyed by name+size; autosave 300 ms
+Undo / redo history,edit,must,yes,no,
+Before / after,edit,must,yes,yes,press and hold
+Exposure contrast highlights shadows whites blacks,light,must,yes,yes,
+Temp tint vibrance saturation,color,must,yes,yes,
+Tone curve (RGB + per channel),light,must,yes,no,256-entry LUT texture
+Color mixer (HSL per 8 hues),color,must,yes,no,
+Color grading (shadows/mid/highlights wheels),color,should,yes,no,
+Texture clarity dehaze,effects,must,yes,no,needs blur pass
+Vignette,effects,must,yes,yes,
+Grain,effects,should,yes,no,
+Sharpening,detail,must,yes,no,
+Noise reduction (classic),detail,should,yes,no,bilateral shader; not AI Denoise
+Crop with aspect presets,crop,must,yes,no,
+Straighten rotate flip,crop,must,yes,no,
+Manual perspective (vertical/horizontal),geometry,should,yes,no,
+Guided / auto Upright,geometry,could,yes,no,line detection
+Manual lens distortion + chromatic aberration,optics,should,yes,no,
+Lens profile corrections,optics,could,yes,no,needs a lens database (lensfun data)
+Auto settings,light,should,yes,no,from histogram
+Histogram,edit,should,yes,no,
+Profiles (Color / Mono / creative LUTs),profiles,should,yes,no,.cube import as 3D LUT
+Presets: create apply import,presets,must,yes,no,
+Copy / paste edits,presets,must,yes,no,
+Batch apply to selected photos,presets,should,yes,no,
+Linear gradient mask,masking,should,yes,no,
+Radial gradient mask,masking,should,yes,no,
+Brush mask,masking,should,yes,no,
+Color range / luminance range mask,masking,should,yes,no,
+Mask feather and edge sliders,masking,should,yes,no,
+Select subject / sky / background (AI),masking,could,yes,no,needs ML Kit segmentation = a dependency; breaks 'light'
+Heal and clone brush,retouch,should,yes,no,
+Content-aware remove,retouch,could,yes,no,PatchMatch on CPU
+Blemish / dust spot auto-remove,retouch,could,yes,no,
+Versions (named snapshots),library,should,yes,no,
+Ratings flags color labels,library,must,yes,no,
+Albums,library,should,yes,no,
+Filter and search by rating/flag/date,library,should,yes,no,
+Export JPEG with quality and size,export,must,yes,partial,JPEG 95 only today
+Export PNG / TIFF / original,export,should,yes,no,framework encodes PNG; TIFF needs a writer
+Keep EXIF on export,export,must,yes,no,android.media.ExifInterface
+Full-resolution export beyond 4096px,export,must,yes,no,tiled render
+Watermark,export,could,yes,no,
+Share to other apps,export,should,yes,no,
+DNG RAW,import,must,yes,partial,ImageDecoder decodes DNG; untested
+Proprietary RAW (CR3 NEF ARW),import,could,yes,no,needs LibRaw native lib
+HDR editing and Ultra HDR export,hdr,could,yes,no,gainmap API 34+
+Lens blur (AI depth),effects,could,yes,skip,needs depth model
+Generative remove / expand / prompt to edit,ai,skip,yes,skip,cloud AI models; not an app feature you can rebuild offline
+Natural language search,ai,skip,yes,skip,cloud AI
+Cloud sync across devices,sync,skip,yes,skip,personal single-device app
+Shared albums and community,sharing,skip,yes,skip,their network
+Video editing,video,skip,yes,skip,separate product
+In-app pro camera,camera,skip,yes,skip,use the phone camera app
+Edit replay videos / photo to video,sharing,skip,yes,skip,
