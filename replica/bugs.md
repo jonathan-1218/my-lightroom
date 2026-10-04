@@ -9,7 +9,7 @@ Severity: S1 data loss / security hole, S2 broken without workaround, S3 broken 
 | id | sev | app | bug | fix |
 | --- | --- | --- | --- | --- |
 | B01 | S2 | Android | An .xmp with ~300k curve points made a preset over 2 MB; every editor open then crashed reading it (CursorWindow limit) and only Clear data recovered | curves capped at 64 points, preset JSON capped at 64 KB, every edit validated on load |
-| B02 | S2 | both | Two photos with the same name and size share one record; the Mac also hid the second file | Mac lists by file path; key collision documented (see Open) |
+| B02 | S2 | both | Two photos with the same name and size share one record; the Mac also hid the second file | partly: the Mac now lists both files; they still share edits (see Open) |
 | B03 | S2 | both | A photo whose size changed (metadata rewritten by another app) lost its edits | record follows the file path to the new key |
 | B04 | S2 | Mac | Database write errors ignored: a failed save was treated as saved and lost on quit; a rejected rating still showed | errors reported; screen only updates when the write succeeds |
 | B05 | S2 | Mac | Schema created without a transaction or version: a half-made database was never repaired; a missing schema crashed later | one transaction, `user_version` set, clear failure message |

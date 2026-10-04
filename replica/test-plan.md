@@ -43,7 +43,7 @@ No network, accounts, payments, email or timezone-dependent features exist, so t
 
 Not driven by hand on Mac (background automation can't move SwiftUI sliders or paint): slider drags, brush strokes,
 curve points, batch actions, imports. Their logic is covered by the self-test; the controls themselves are untested there.
-Security and database review: see `bugs.md` (27 bugs, all fixed or accepted; 0 open S1/S2).
+Security and database review: see `bugs.md` (27 bugs: 26 fixed; B02 key collision partly fixed, rest accepted; no S1).
 
 ## After fixes
 
