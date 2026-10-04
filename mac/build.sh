@@ -8,7 +8,7 @@ swift build -c release --arch arm64
 APP=Lumen.app
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/Lumen "$APP/Contents/MacOS/Lumen"
-cp ../src/main/assets/schema.sql ../src/main/assets/tokens.json "$APP/Contents/Resources/" # one source of truth with Android
+cp ../src/main/assets/schema.sql ../src/main/assets/migrate_*.sql ../src/main/assets/tokens.json "$APP/Contents/Resources/" # one source of truth with Android
 cp AppIcon.icns "$APP/Contents/Resources/" # made from ../logo/lumen-icon-fullbleed.svg
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -9,8 +9,10 @@ class Row(val id: Long, val edit: String, val rating: Int, val flag: Int, val la
 class Preset(val id: Long, val name: String, val edit: String)
 
 /** App-private SQLite. `name = null` gives an in-memory DB (self-test). Screens share one instance: `Db.get(context)`. */
-class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelper(ctx, name, null, 1) {
+class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelper(ctx, name, null, VERSION) {
     companion object {
+        val TOLD = "*|" + "[0-9a-f]".repeat(16) // a key from told()
+        const val VERSION = 2 // schema.sql is v1; migrate_<n>.sql takes it to n (the Mac app runs the same files)
         @Volatile private var shared: Db? = null
         fun get(ctx: Context): Db = shared ?: synchronized(this) { shared ?: Db(ctx.applicationContext).also { shared = it } }
     }
@@ -24,22 +26,38 @@ class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelpe
 
     override fun onConfigure(db: SQLiteDatabase) = db.setForeignKeyConstraintsEnabled(true)
 
-    override fun onCreate(db: SQLiteDatabase) =
-        ctx.assets.open("schema.sql").bufferedReader().use { it.readText() }
-            .lines().filterNot { it.trimStart().startsWith("--") }.joinToString("\n")
-            .split(';').map { it.trim() }.filter { it.isNotEmpty() }
-            .forEach(db::execSQL)
+    /** Statements of a .sql file in assets: each ends at a ";" that ends a line (trigger bodies keep theirs). */
+    fun statements(file: String) = ctx.assets.open(file).bufferedReader().use { it.readText() }
+        .lines().filterNot { it.trimStart().startsWith("--") }.joinToString("\n")
+        .split(Regex(";\\s*\n")).map { it.trim().removeSuffix(";") }.filter { it.isNotEmpty() }
 
-    // ponytail: no migrations until schema v2 exists, then run assets/migrate_<n>.sql here
-    override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {}
+    private fun run(db: SQLiteDatabase, file: String) = statements(file).forEach(db::execSQL)
 
-    /** The photo's row, created on first open. */
-    fun open(key: String, uri: Uri, w: Int, h: Int): Row = tx {
+    // both run inside SQLiteOpenHelper's transaction: a failed step leaves the old version untouched
+    override fun onCreate(db: SQLiteDatabase) { run(db, "schema.sql"); onUpgrade(db, 1, VERSION) }
+    override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) { for (v in old + 1..new) run(db, "migrate_$v.sql") }
+
+    /** Plain name|size keys whose files were told apart: they keep hashed keys even after one of the twins is gone. */
+    fun split(): Set<String> = readableDatabase.rawQuery("select substr(key, 1, length(key) - 17) from photos where key glob ?", arrayOf(TOLD)).use { c ->
+        buildSet { while (c.moveToNext()) add(c.getString(0)) }
+    }
+
+    private fun has(key: String) = readableDatabase.rawQuery("select 1 from photos where key = ?", arrayOf(key)).use { it.count > 0 }
+
+    /** The photo's row, created on first open. `shared` is the plain name|size key when `key` tells apart files sharing it. */
+    fun open(key: String, uri: Uri, w: Int, h: Int, shared: String = key): Row = tx {
         val now = System.currentTimeMillis()
         // Same file under a new key (its size changed, e.g. another app rewrote the metadata): keep its edits.
-        val known = readableDatabase.rawQuery("select 1 from photos where key = ?", arrayOf(key)).use { it.count > 0 }
-        if (!known) writableDatabase.execSQL("update photos set key = ? where uri = ? and not exists (select 1 from photos where key = ?)",
+        if (!has(key)) writableDatabase.execSQL("update photos set key = ? where uri = ? and not exists (select 1 from photos where key = ?)",
             arrayOf(key, uri.toString(), key))
+        // Two files with one name and size used to share a row. The first told apart takes it (versions, albums);
+        // the others start from a copy of it, so each keeps what it showed.
+        if (!has(key) && shared != key) {
+            if (has(shared)) writableDatabase.execSQL("update photos set key = ? where key = ?", arrayOf(key, shared))
+            else writableDatabase.execSQL("insert into photos (key, uri, added_at, updated_at, width, height, rating, flag, label, edit) " +
+                "select ?, ?, ?, ?, ?, ?, rating, flag, label, edit from photos where substr(key, 1, length(?) + 1) = ? || '|' limit 1",
+                arrayOf(key, uri.toString(), now, now, maxOf(1, w), maxOf(1, h), shared, shared))
+        }
         writableDatabase.execSQL(
             "insert into photos (key, uri, added_at, updated_at, width, height) values (?,?,?,?,?,?) " +
                 "on conflict (key) do update set uri = excluded.uri, " +
@@ -68,7 +86,7 @@ class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelpe
     }
 
     /** Row for a photo seen only in the library (batch edits, albums), without decoding it. */
-    fun ensure(key: String, uri: Uri, w: Int, h: Int): Long = open(key, uri, w.coerceAtLeast(1), h.coerceAtLeast(1)).id
+    fun ensure(key: String, uri: Uri, w: Int, h: Int, shared: String = key): Long = open(key, uri, w.coerceAtLeast(1), h.coerceAtLeast(1), shared).id
 
     /** key → (edit, updated_at) for photos whose edit is not the default: the library renders these thumbnails. */
     fun edited(): Map<String, Pair<String, Long>> {

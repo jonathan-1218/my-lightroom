@@ -105,8 +105,8 @@ object Profiles {
  * Reads a Lightroom / Camera Raw .xmp preset (the user's own file) into Lumen's edit JSON.
  * Settings Lumen has no equivalent for are skipped. Returns (name, edit json), or null if nothing usable was found.
  */
-fun sha256(s: String): String =
-    java.security.MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }
+fun sha256(s: String): String = sha256(s.toByteArray())
+fun sha256(b: ByteArray): String = java.security.MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
 
 /** `name`, or "name (2)", "name (3)"… — the first one not in `taken`. */
 fun unique(name: String, taken: Collection<String>): String =

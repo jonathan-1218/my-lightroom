@@ -39,8 +39,14 @@ private val LABELS = listOf(null, "red", "yellow", "green", "blue", "purple")
 /** Copied develop settings (no crop). ponytail: lives as long as the process; persist if copy-then-reopen matters */
 object Clip { var edit: String? = null }
 
-// ponytail: name + size identifies a photo across picker, gallery and MediaStore URIs; collides only on identical name and size
+// Name + size identifies a photo across picker, gallery and MediaStore URIs. Files that share both get `told(apart)`.
 fun key(name: String?, size: Long, fallback: Uri) = if (name != null) "$name|$size" else fallback.toString()
+
+/** `key|` + a hash of the file's first 64 KB (its EXIF): different photos with one name and size part, copies still match.
+ *  Same rule and hash as the Mac app. */
+fun android.content.Context.told(key: String, uri: Uri): String = key + "|" + (runCatching {
+    contentResolver.openInputStream(uri)!!.use { sha256(it.readNBytes(64 shl 10)) }
+}.getOrNull() ?: sha256(uri.toString())).take(16)
 
 /** S02 editor (with S03 crop and S06 presets as panels). */
 class MainActivity : Activity() {
@@ -50,7 +56,9 @@ class MainActivity : Activity() {
     private var row: Row? = null
     private var source: Uri? = null
     private val ui = Handler(Looper.getMainLooper())
-    private val saveEdit = Runnable { row?.let { db.saveEdit(it.id, edit.toJson()) } }
+    private val io = java.util.concurrent.Executors.newSingleThreadExecutor() // saves in order, off the UI thread
+    // autosave: a big brush mask takes tens of ms to serialise, so only the copy happens here
+    private val saveEdit = Runnable { val r = row ?: return@Runnable; val e = edit.copy(); io.execute { db.saveEdit(r.id, e.toJson()) } }
     // ponytail: in-memory history, lost when the editor closes; Versions (S07) cover keeping states
     private val undo = ArrayDeque<Edit>()
     private val redo = ArrayDeque<Edit>()
@@ -60,11 +68,21 @@ class MainActivity : Activity() {
     private val sync = mutableListOf<() -> Unit>() // re-read every control from `edit` (load, undo, preset)
     private val syncMarks = mutableListOf<() -> Unit>()
 
+    // Leaving: save now (the process may be swiped away) and wait, so the library underneath reads the latest edit.
+    override fun onPause() {
+        super.onPause()
+        if (ui.hasCallbacks(saveEdit)) { ui.removeCallbacks(saveEdit); saveEdit.run() }
+        runCatching { io.submit {}.get() }
+    }
+
+    override fun onDestroy() { io.shutdown(); super.onDestroy() } // queued saves still run
+
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         // Test switches: debug builds only, so other apps can't drive them on the installed app.
         val debuggable = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
         if (debuggable && intent.getBooleanExtra("selftest", false)) return selfTest()
+        if (debuggable && intent.getBooleanExtra("bench", false)) return Thread { bench(); finish() }.start()
         Ui.init(this)
         Profiles.init(this)
         if (debuggable && intent.getBooleanExtra("design", false)) return setContentView(designGallery().apply { fitInsets() })
@@ -568,7 +586,8 @@ class MainActivity : Activity() {
     private fun load(uri: Uri) = Thread {
         val result = runCatching {
             val (bmp, size) = decode(uri) { 2048f / maxOf(it.width, it.height) } // preview: the shader runs per screen pixel, 2048 is plenty
-            Look(bmp) to db.open(keyOf(uri), uri, size.width, size.height)
+            val (key, shared) = keyOf(uri)
+            Look(bmp) to db.open(key, uri, size.width, size.height, shared)
         }.onFailure { Log.w("Lumen", "open failed: ${it.javaClass.simpleName}") }.getOrNull()
         runOnUiThread {
             if (result == null) return@runOnUiThread toast("Can't open this file")
@@ -587,10 +606,18 @@ class MainActivity : Activity() {
     /** Photos from other apps come as content:// from someone else's provider: never file:// paths, never our own files. */
     private fun acceptable(uri: Uri) = uri.scheme == "content" && uri.authority?.startsWith(packageName) != true
 
-    private fun keyOf(uri: Uri): String = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
-        ?.use { if (it.moveToFirst()) key(it.getString(0), it.getLong(1), uri) else null } ?: uri.toString()
+    /** (key, shared name|size key). Another photo in the library with the same name and size means the key needs its hash. */
+    private fun keyOf(uri: Uri): Pair<String, String> {
+        val (name, size) = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
+            ?.use { if (it.moveToFirst() && !it.isNull(0)) it.getString(0) to it.getLong(1) else null } ?: return uri.toString() to uri.toString()
+        val plain = key(name, size, uri)
+        val twins = runCatching {
+            contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Images.Media._ID),
+                "${MediaStore.Images.Media.DISPLAY_NAME} = ? and ${MediaStore.Images.Media.SIZE} = ?", arrayOf(name, size.toString()), null)?.use { it.count }
+        }.getOrNull() ?: 0
+        return (if (twins > 1 || plain in db.split()) told(plain, uri) else plain) to plain
+    }
 
-    /** S08: format, size, quality, metadata; Export saves to Pictures/Lumen, Share also hands it to another app. */
     /** S08: format, size, quality, metadata, watermark; Export saves to Pictures/Lumen, Share also hands it to another app. */
     private fun exportDialog() {
         if (source == null) return toast("Open a photo first")
@@ -697,6 +724,15 @@ class MainActivity : Activity() {
         checks["unpicked colour mask"] = Color.red(masked(Mask("color").apply { adj[0] = 1f }).getPixel(32, 32)) in 98..102
         val inverted = masked(Mask("radial").apply { this.g = floatArrayOf(0.5f, 0.5f, 0.25f, 0.25f); adj[0] = 1f; invert = true })
         checks["inverted mask"] = Color.red(inverted.getPixel(32, 32)) in 98..102 && Color.red(inverted.getPixel(2, 2)) > 140
+        // brush: painting adds only the new part of the stroke; the result must equal a full redraw
+        val painted = Mask("brush").apply { adj[0] = 1f; feather = 0.5f; strokes = listOf(Stroke(floatArrayOf(0.1f, 0.5f, 0.3f, 0.5f), 0.1f, false)) }
+        val live = Look(flat); val live1 = Edit().apply { masks = listOf(painted) }
+        live.render(live1)
+        painted.strokes = listOf(Stroke(painted.strokes[0].pts + floatArrayOf(0.6f, 0.5f, 0.9f, 0.4f), 0.1f, false), Stroke(floatArrayOf(0.5f, 0.1f, 0.5f, 0.9f), 0.05f, true))
+        val grown = live.render(live1); val fresh = Look(flat).render(Edit().apply { masks = listOf(painted) })
+        checks["brush grows = redraw"] = (0 until 64 step 4).all { x -> (0 until 64 step 4).all { y ->
+            abs(Color.red(grown.getPixel(x, y)) - Color.red(fresh.getPixel(x, y))) <= 3 } } &&
+            Color.red(fresh.getPixel(16, 32)) > 140 && Color.red(fresh.getPixel(32, 32)) < 120 && Color.red(fresh.getPixel(32, 8)) in 98..102
         // heal: a dark dot on grey is gone after one spot
         val dotted = flat.copy(Bitmap.Config.ARGB_8888, true).apply { for (x in 30..34) for (y in 30..34) setPixel(x, y, Color.BLACK) }
         val healed = bake(dotted, listOf(Spot(0.5f, 0.5f, 0.2f, 0.2f, 0.08f, heal = true)))
@@ -799,8 +835,73 @@ class MainActivity : Activity() {
         checks["db follows a resized file"] = again2.id == moved.id &&
             d.readableDatabase.rawQuery("select width from photos where id = ?", arrayOf(moved.id.toString())).use { it.moveToFirst(); it.getInt(0) } == 400
 
+        // schema v2: whole-number ratings, dead index gone
+        checks["schema v2"] = d.readableDatabase.version == Db.VERSION && runCatching { d.mark(moved.id, "rating", 2.5) }.isFailure &&
+            d.readableDatabase.rawQuery("select 1 from sqlite_master where name = 'photos_taken'", null).use { it.count == 0 }
+        // twins: two files, one name and size. The first told apart keeps the row, the other starts from a copy; then they part.
+        val twin = d.open("t.jpg|5", Uri.parse("content://x/t"), 10, 10)
+        d.saveEdit(twin.id, """{"v":1,"light":{"exposure":0.5}}"""); d.mark(twin.id, "rating", 3)
+        val ta = d.open("t.jpg|5|aaaaaaaaaaaaaaaa", Uri.parse("content://x/a"), 10, 10, shared = "t.jpg|5")
+        val tb = d.open("t.jpg|5|bbbbbbbbbbbbbbbb", Uri.parse("content://x/b"), 10, 10, shared = "t.jpg|5")
+        d.saveEdit(tb.id, """{"v":1}""")
+        checks["twins part"] = ta.id == twin.id && tb.id != ta.id && tb.edit == ta.edit && tb.rating == 3 &&
+            d.editOf(ta.id).contains("exposure") && "t.jpg|5" in d.split() && "a.jpg|1" !in d.split()
+        val f1 = java.io.File(cacheDir, "t1.jpg").apply { writeBytes(ByteArray(70000) { 1 }) }
+        val f2 = java.io.File(cacheDir, "t2.jpg").apply { writeBytes(ByteArray(70000) { 2 }) }
+        val f3 = java.io.File(cacheDir, "t3.jpg").apply { writeBytes(ByteArray(70000) { 1 }) }
+        checks["told apart"] = told("k", Uri.fromFile(f1)) != told("k", Uri.fromFile(f2)) && told("k", Uri.fromFile(f1)) == told("k", Uri.fromFile(f3)) &&
+            told("k", Uri.fromFile(f1)).matches(Regex("k\\|[0-9a-f]{16}"))
+        listOf(f1, f2, f3).forEach { it.delete() }
+
+        // a v1 database (as installed before) upgrades in place: photos, versions and album entries all stay
+        val v1 = getDatabasePath("v1test.db").apply { delete(); parentFile?.mkdirs() }
+        android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(v1, null).use { raw ->
+            (d.statements("schema.sql") + listOf("insert into photos (key, uri, added_at, updated_at, width, height, rating) values ('o.jpg|1', 'content://o', 1, 1, 9, 9, 2)",
+                "insert into versions (photo_id, name, edit, created_at) values (1, 'v', '{}', 1)",
+                "insert into albums (name, created_at, updated_at) values ('A', 1, 1)", "insert into album_photos values (1, 1, 1)")).forEach(raw::execSQL)
+            raw.version = 1
+        }
+        val up = Db(this, v1.path)
+        checks["v1 upgrades"] = up.readableDatabase.version == Db.VERSION && up.versions(1).size == 1 && up.albumKeys(1) == setOf("o.jpg|1") &&
+            up.readableDatabase.rawQuery("select 1 from sqlite_master where name = 'photos_taken'", null).use { it.count == 0 }
+        up.close(); deleteDatabase("v1test.db")
+
         val ok = checks.values.all { it }
         Log.i("Lumen", "selftest ${if (ok) "PASS" else "FAIL ${checks.filterValues { !it }.keys}"} (${checks.size} checks) base=${Integer.toHexString(base)} bright=${Integer.toHexString(bright)} warm=${Integer.toHexString(warm)} red=${Integer.toHexString(red)}")
         finish()
+    }
+
+    // adb shell am start -S -n dev.lumen/.MainActivity --ez bench true ; adb logcat -s Lumen
+    /** Median times of the paths a user waits on, on the biggest JPEG in the library. Run before and after a performance change. */
+    private fun bench() {
+        fun ms(n: Int = 5, f: () -> Unit): Double {
+            f() // warm up
+            return (0 until n).map { val t = System.nanoTime(); f(); (System.nanoTime() - t) / 1e6 }.sorted()[n / 2]
+        }
+        val uri = contentResolver.query(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, arrayOf("_id"), "mime_type = ?", arrayOf("image/jpeg"), "_size desc") // the biggest JPEG: worst case
+            ?.use { if (it.moveToFirst()) android.content.ContentUris.withAppendedId(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, it.getLong(0)) else null }
+            ?: return Log.i("Lumen", "bench: no photo").let { }
+        val (bmp, size) = decode(uri) { 2048f / maxOf(it.width, it.height) }
+        val e = Edit().apply { this["exposure"] = 0.3f; this["clarity"] = 0.3f; this["noise"] = 0.4f; this["straighten"] = 0.05f; this["texture"] = 0.2f }
+        val brushed = e.copy().apply { masks = listOf(Mask("brush").apply { adj[0] = 0.5f
+            strokes = (0 until 20).map { s -> Stroke(FloatArray(1000) { i -> if (i % 2 == 0) i / 1000f else s / 20f + 0.02f * kotlin.math.sin(i / 40f) }, 0.05f, false) } }) }
+        val l = Look(bmp)
+        fun frame(x: Edit) = gpu(1080, 1440) { c -> c.scale(1080f / bmp.width, 1080f / bmp.width); l.draw(c, x) }
+        var n = 0f
+        val rows = listOf(
+            "decode 2048" to ms { decode(uri) { 2048f / maxOf(it.width, it.height) } },
+            "open (Look)" to ms { Look(bmp) },
+            "preview, slider move" to ms { n += 0.01f; e["exposure"] = n % 1; frame(e) },
+            "brush stroke grows" to ms { val m = brushed.masks[0]; val s = m.strokes.last()
+                m.strokes = m.strokes.dropLast(1) + Stroke(s.pts + floatArrayOf(0.5f, 0.5f), s.size, s.erase); frame(brushed) },
+            "brush grows, no feather" to ms { val m = brushed.masks[0]; m.feather = 0f; val s = m.strokes.last()
+                m.strokes = m.strokes.dropLast(1) + Stroke(s.pts + floatArrayOf(0.5f, 0.5f), s.size, s.erase); frame(brushed); m.feather = 0.5f },
+            "gpu() setup alone" to ms { gpu(16, 16) {} },
+            "histogram" to ms { val (ow, oh) = e.outSize(l.src.width, l.src.height); val k = 200f / maxOf(ow, oh)
+                histogram(gpu(maxOf(1, (ow * k).toInt()), maxOf(1, (oh * k).toInt())) { it.scale(k, k); l.draw(it, e) }) },
+            "autosave (brushed), off UI" to ms { Db.get(this).saveEdit(-1, brushed.toJson()) },
+            "export full size" to ms(3) { Look(decode(uri) { 1f }.first).render(e) },
+        )
+        Log.i("Lumen", "bench ${size.width}x${size.height}\n" + rows.joinToString("\n") { (k, t) -> "%-24s %7.1f ms".format(k, t) })
     }
 }

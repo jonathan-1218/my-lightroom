@@ -9,6 +9,9 @@ enum Entry {
         if let i = CommandLine.arguments.firstIndex(of: "--check"), CommandLine.arguments.count > i + 1 {
             exit(checkFolder(URL(fileURLWithPath: CommandLine.arguments[i + 1])) ? 0 : 1)
         }
+        if let i = CommandLine.arguments.firstIndex(of: "--bench"), CommandLine.arguments.count > i + 1 {
+            exit(bench(URL(fileURLWithPath: CommandLine.arguments[i + 1])) ? 0 : 1)
+        }
         LumenApp.main()
     }
 }
@@ -118,6 +121,10 @@ final class AppModel: ObservableObject {
     init() {
         presets = db.presets()
         refresh()
+        // Quit within the autosave delay: save now, or the last change is lost
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.saveNow()
+        }
     }
 
     // MARK: library
@@ -135,8 +142,12 @@ final class AppModel: ObservableObject {
         scanning = true
         let fs = folders
         DispatchQueue.global(qos: .userInitiated).async {
-            let list = scan(fs)
-            DispatchQueue.main.async { self.photos = list; self.scanning = false; self.reloadRows() }
+            let list = scan(fs, split: self.db.split())
+            DispatchQueue.main.async {
+                // twins get rows of their own before the grid reads ratings and edits
+                self.db.tx { list.allSatisfy { p in p.shared.map { self.db.open(key: p.key, uri: p.url.path, w: 1, h: 1, shared: $0) }; return true } }
+                self.photos = list; self.scanning = false; self.reloadRows()
+            }
         }
     }
 
@@ -196,7 +207,7 @@ final class AppModel: ObservableObject {
                 self.loading = false
                 guard let cg else { self.say("Can't open this file"); self.current = nil; return }
                 let l = Look(cg); let o = Tokens.rgba("overlay"); l.overlay = (o.0, o.1, o.2)
-                let r = self.db.open(key: p.key, uri: p.url.path, w: w, h: h)
+                let r = self.db.open(key: p.key, uri: p.url.path, w: w, h: h, shared: p.shared)
                 self.row = r; self.look = l
                 var e = Edit(); e.merge(r.edit)
                 self.undoStack = []; self.redoStack = []

@@ -1,3 +1,4 @@
+import SQLite3
 import Foundation
 import CoreGraphics
 import CoreImage
@@ -57,6 +58,15 @@ func selfTest() -> Bool {
     var radial = Mask(type: "radial"); radial.g = [0.5, 0.5, 0.25, 0.25]; radial.adj[0] = 1
     let rr = masked(radial)
     check("radial mask", px(rr, 32, 32).0 > 140 && near(px(rr, 2, 2).0, 100))
+    // brush: painting adds only the new part of the stroke; the result must equal a full redraw
+    var painted = Mask(type: "brush"); painted.adj[0] = 1; painted.feather = 0.5
+    painted.strokes = [Stroke(pts: [0.1, 0.5, 0.3, 0.5], size: 0.1, erase: false)]
+    let live = Look(flat); var live1 = Edit(); live1.masks = [painted]; _ = live.render(live1)
+    live1.masks[0].strokes[0].pts += [0.6, 0.5, 0.9, 0.4]
+    live1.masks[0].strokes.append(Stroke(pts: [0.5, 0.1, 0.5, 0.9], size: 0.05, erase: true))
+    let grown = live.render(live1), fresh = Look(flat).render(live1)
+    check("brush grows = redraw", stride(from: 0, to: 64, by: 4).allSatisfy { x in stride(from: 0, to: 64, by: 4).allSatisfy { y in abs(px(grown, x, y).0 - px(fresh, x, y).0) <= 3 } }
+          && px(fresh, 16, 32).0 > 140 && px(fresh, 32, 32).0 < 120 && near(px(fresh, 32, 8).0, 100))
     var lin = Mask(type: "linear"); lin.g = [0.5, 0, 0.5, 0.5]; lin.adj[0] = 1
     let lr = masked(lin)
     check("gradient mask", px(lr, 32, 1).0 > 140 && near(px(lr, 32, 60).0, 100))
@@ -171,6 +181,41 @@ func selfTest() -> Bool {
     check("db follows a resized file", again2.id == moved.id && d.query("select width from photos where id = ?", [moved.id]) { $0.int(0) }.first == 400)
     check("db transaction rolls back", !d.tx { d.saveEdit(moved.id, "{\"v\":1,\"light\":{\"exposure\":0.5}}"); return false } && d.editOf(moved.id) == "{\"v\":1}")
 
+    // schema v2: whole-number ratings, dead index gone
+    check("schema v2", d.query("pragma user_version") { $0.int(0) }.first == Int64(Db.version) && !d.mark(moved.id, "rating", 2.5)
+          && d.query("select 1 from sqlite_master where name = 'photos_taken'") { $0.int(0) }.isEmpty)
+    // twins: two files, one name and size. The first told apart keeps the row, the other starts from a copy; then they part.
+    let twin = d.open(key: "t.jpg|5", uri: "/t/t.jpg", w: 10, h: 10)
+    d.saveEdit(twin.id, "{\"v\":1,\"light\":{\"exposure\":0.5}}"); d.mark(twin.id, "rating", 3)
+    let ta = d.open(key: "t.jpg|5|aaaaaaaaaaaaaaaa", uri: "/a/t.jpg", w: 10, h: 10, shared: "t.jpg|5")
+    let tb = d.open(key: "t.jpg|5|bbbbbbbbbbbbbbbb", uri: "/b/t.jpg", w: 10, h: 10, shared: "t.jpg|5")
+    d.saveEdit(tb.id, "{\"v\":1}")
+    check("twins part", ta.id == twin.id && tb.id != ta.id && tb.edit == ta.edit && tb.rating == 3 && d.editOf(ta.id).contains("exposure")
+          && d.split().contains("t.jpg|5") && !d.split().contains("a.jpg|1"))
+    // told apart: same name and size, different bytes → different keys; a copy → the same key. scan() does it by itself.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("lumen-twins-\(getpid())")
+    for (sub, byte) in [("a", 1), ("b", 2), ("c", 1)] {
+        try? FileManager.default.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true)
+        try? Data(repeating: UInt8(byte), count: 70000).write(to: dir.appendingPathComponent("\(sub)/t.jpg"))
+    }
+    let keys = scan([dir]).sorted { $0.url.path < $1.url.path }.map(\.key)
+    check("told apart", keys.count == 3 && keys[0] != keys[1] && keys[0] == keys[2] && keys[0].hasPrefix("t.jpg|70000|") && keys[0].count == "t.jpg|70000|".count + 16
+          && told("k", dir.appendingPathComponent("a/t.jpg")) == "k|" + keys[0].suffix(16))
+    try? FileManager.default.removeItem(at: dir)
+
+    // a v1 database (as installed before) upgrades in place: photos, versions and album entries all stay
+    let v1 = FileManager.default.temporaryDirectory.appendingPathComponent("lumen-v1-\(getpid()).db").path
+    var raw: OpaquePointer?
+    sqlite3_open(v1, &raw)
+    for q in sqlFile("schema") + ["pragma user_version = 1", "insert into photos (key, uri, added_at, updated_at, width, height, rating) values ('o.jpg|1', '/o', 1, 1, 9, 9, 2)",
+                                  "insert into versions (photo_id, name, edit, created_at) values (1, 'v', '{}', 1)",
+                                  "insert into albums (name, created_at, updated_at) values ('A', 1, 1)", "insert into album_photos values (1, 1, 1)"] { sqlite3_exec(raw, q, nil, nil, nil) }
+    sqlite3_close(raw)
+    let up = Db(path: v1)
+    check("v1 upgrades", up.query("pragma user_version") { $0.int(0) }.first == Int64(Db.version) && up.versions(1).count == 1 && up.albumKeys(1) == ["o.jpg|1"]
+          && up.query("select rating from photos") { $0.int(0) } == [2] && up.query("select 1 from sqlite_master where name = 'photos_taken'") { $0.int(0) }.isEmpty)
+    try? FileManager.default.removeItem(atPath: v1)
+
     let failed = checks.filter { !$0.1 }.map(\.0)
     print("selftest \(failed.isEmpty ? "PASS" : "FAIL \(failed)") (\(checks.count) checks) base=\(base) bright=\(bright) warm=\(warm) red=\(red) level=\(level)")
     return failed.isEmpty
@@ -192,5 +237,39 @@ func checkFolder(_ folder: URL) -> Bool {
         print(String(format: "ok %5.0f ms  %dx%d → %dx%d  %@", Date().timeIntervalSince(t0) * 1000, cg.width, cg.height, out.width, out.height, p.url.lastPathComponent))
     }
     print("\(opened) of \(photos.count) opened, the rest refused cleanly")
+    return true
+}
+
+/// `Lumen --bench <photo>`: median times of the paths a user waits on. Run before and after a performance change.
+func bench(_ url: URL) -> Bool {
+    func ms(_ n: Int = 5, _ f: () -> Void) -> Double {
+        f() // warm up: kernel compile, caches
+        let t = (0..<n).map { _ in let t0 = Date(); f(); return Date().timeIntervalSince(t0) * 1000 }.sorted()
+        return t[n / 2]
+    }
+    guard let cg = decode(url, maxPixel: 2048) else { print("can't open \(url.path)"); return false }
+    var e = Edit(); e["exposure"] = 0.3; e["clarity"] = 0.3; e["noise"] = 0.4; e["straighten"] = 0.05; e["texture"] = 0.2
+    var brushed = e
+    var m = Mask(type: "brush"); m.adj[0] = 0.5
+    for s in 0..<20 {
+        var pts = [Float]()
+        for i in 0..<500 { let x = Float(i) / 500; pts += [x, Float(s) / 20 + 0.02 * sin(Float(i) / 20)] }
+        m.strokes.append(Stroke(pts: pts, size: 0.05, erase: false))
+    }
+    brushed.masks = [m]
+    let l = Look(cg)
+    var n = 0.0
+    let rows: [(String, Double)] = [
+        ("decode 2048", ms { _ = decode(url, maxPixel: 2048) }),
+        ("library thumbnail", ms { _ = decode(url, maxPixel: 320) }),
+        ("open (Look)", ms { _ = Look(cg) }),
+        ("preview, slider move", ms { n += 0.01; e["exposure"] = Float(n.truncatingRemainder(dividingBy: 1)); _ = l.render(e, maxLong: 1600) }),
+        ("preview, brush mask", ms { n += 0.01; brushed["exposure"] = Float(n.truncatingRemainder(dividingBy: 1)); _ = l.render(brushed, maxLong: 1600) }),
+        ("brush stroke grows", ms { brushed.masks[0].strokes[19].pts += [0.5, 0.5]; _ = l.render(brushed, maxLong: 1600) }),
+        ("histogram", ms { _ = histogram(l.render(e, maxLong: 200)) }),
+        ("autosave (brushed)", ms { _ = brushed.json() }),
+        ("export full size", ms(3) { _ = decode(url).flatMap { Look($0).renderOrNil(e) } }),
+    ]
+    for (name, t) in rows { print(name.padding(toLength: 24, withPad: " ", startingAt: 0) + String(format: "%7.1f ms", t)) }
     return true
 }

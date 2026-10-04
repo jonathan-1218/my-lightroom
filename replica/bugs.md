@@ -1,7 +1,7 @@
 # Bugs: Lumen (Android + Mac)
 
 From the 2026-10-04 test pass: hands-on hostile-file testing on both apps, a security review and a database cross-check.
-Every fixed bug has a self-test check that fails without the fix (Android 35 checks, Mac 38 checks, both PASS).
+Every fixed bug has a self-test check that fails without the fix (Android 40 checks, Mac 43 checks, both PASS).
 Severity: S1 data loss / security hole, S2 broken without workaround, S3 broken with workaround, S4 cosmetic.
 
 ## Fixed
@@ -9,7 +9,7 @@ Severity: S1 data loss / security hole, S2 broken without workaround, S3 broken 
 | id | sev | app | bug | fix |
 | --- | --- | --- | --- | --- |
 | B01 | S2 | Android | An .xmp with ~300k curve points made a preset over 2 MB; every editor open then crashed reading it (CursorWindow limit) and only Clear data recovered | curves capped at 64 points, preset JSON capped at 64 KB, every edit validated on load |
-| B02 | S2 | both | Two photos with the same name and size share one record; the Mac also hid the second file | partly: the Mac now lists both files; they still share edits (see Open) |
+| B02 | S2 | both | Two photos with the same name and size share one record; the Mac also hid the second file | files sharing a name and size get `name\|size\|<hash of first 64 KB>` keys (same hash on both apps); the first keeps the shared row, the others start from a copy; copies of one photo still match |
 | B03 | S2 | both | A photo whose size changed (metadata rewritten by another app) lost its edits | record follows the file path to the new key |
 | B04 | S2 | Mac | Database write errors ignored: a failed save was treated as saved and lost on quit; a rejected rating still showed | errors reported; screen only updates when the write succeeds |
 | B05 | S2 | Mac | Schema created without a transaction or version: a half-made database was never repaired; a missing schema crashed later | one transaction, `user_version` set, clear failure message |
@@ -36,13 +36,23 @@ Severity: S1 data loss / security hole, S2 broken without workaround, S3 broken 
 | B26 | S4 | Mac | SQLite handle not serialized | `SQLITE_OPEN_FULLMUTEX` |
 | B27 | S4 | Android | Two database connections in one process | one shared `Db.get()` |
 
+## Fixed in the second pass (2026-10-04, "fix all the bugs, improve performance")
+
+| id | sev | app | bug | fix |
+| --- | --- | --- | --- | --- |
+| B28 | S3 | both | An edit made just before leaving (Android: app swiped away; Mac: Cmd-Q) waited on the 0.3 s autosave and could be lost | Android saves on pause and waits for it; Mac saves on quit |
+| B29 | S3 | Android | Autosave serialised the edit on the UI thread: 35–60 ms stall every pause while painting a big brush mask | serialised and written on a background thread, in order |
+| B30 | S3 | both | Every brush move redrew the whole mask: painting slowed down as the mask grew (Android ~32 ms CPU per move at 10k points) | only the new part of the stroke is drawn; the feather is one GPU blur (Android 0.3 ms CPU per move, Mac 24 → 11 ms per move) |
+| B31 | S4 | both | `photos_taken` index on a column never filled in; rating CHECK let 2.5 through | schema v2 (`migrate_2.sql`, run by both apps): index dropped, whole-number triggers. No table rebuild, so versions and albums can't cascade away |
+| B32 | S4 | Android | Truncated JPEG refused (the Mac shows what's there) | partial JPEGs open on both; other incomplete files (the header-only bomb PNG) are still refused |
+| B33 | S4 | Android | Blurs read back from the GPU for no reason on every open and spot change | they stay on the GPU as hardware bitmaps |
+| B34 | S4 | Mac | Dead `photoKey()` with its own copy of the key rule | removed; one key rule (`scan` / `told`) |
+
 ## Open (accepted)
 
-- Same name + same byte size = same record (B02). Realistic only for identically sized files with a reused name. A stronger key needs capture date or a content hash on every scan.
-- `photos_taken` index unused; rating CHECK allows 2.5 (not reachable). Changing them needs schema v2 with a migration, so they wait for the next schema change.
-- Android backup is on (default): the database goes to the user's own Google backup. Kept so edits survive a new phone.
-- Truncated JPEG: Android refuses it, the Mac shows the part that's there.
-- Mac app is unsandboxed (ad-hoc signed for personal use). Sandboxing needs security-scoped bookmarks for folders.
+- Android backup is on (default): the database goes to the user's own Google backup. Kept on purpose so edits survive a new phone.
+- Mac app is unsandboxed (ad-hoc signed for personal use). Sandboxing needs security-scoped bookmarks for folders and moves the
+  database into a container, which risks the existing library; worth it only if the app is ever handed to other people.
 
 ## Checked and safe
 

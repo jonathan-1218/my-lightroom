@@ -166,7 +166,7 @@ class LibraryActivity : Activity() {
             }
         }
         pool.execute {
-            val list = runCatching { query() }.getOrNull()
+            val list = runCatching { distinct(query()) }.getOrNull()
             val m = runCatching { db.marks() }.getOrDefault(emptyMap())
             val ed = runCatching { db.edited() }.getOrDefault(emptyMap())
             val albums = runCatching { db.albums().map { it.name to db.albumKeys(it.id) } }.getOrDefault(emptyList())
@@ -222,6 +222,14 @@ class LibraryActivity : Activity() {
                 }
             }
         }
+    }
+
+    /** Photos sharing a name and size get keys of their own (`told`), and their rows are split before the grid reads marks. */
+    private fun distinct(list: List<Photo>): List<Photo> {
+        val twins = list.groupingBy { it.key }.eachCount().filterValues { it > 1 }.keys + db.split()
+        return list.map { p -> if (p.key !in twins) p else Photo(p.uri, p.takenAt, told(p.key, p.uri), p.w, p.h).also {
+            runCatching { db.ensure(it.key, it.uri, it.w, it.h, shared = p.key) }
+        } }
     }
 
     /** Empty, error and no-permission states share one centred message + action. `null` shows the grid. */

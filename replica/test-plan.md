@@ -53,3 +53,22 @@ Security and database review: see `bugs.md` (27 bugs: 26 fixed; B02 key collisio
 | hostile files via intent / library | no crash, 5 refused, 1 opened | `--check`: 4 refused, 2 opened |
 | own private file via `file://` intent | refused before reading | n/a |
 | release build | R8, 239 KB | hardened runtime, 2.1 MB |
+
+## Second pass: fixes and performance
+
+Self-test: Android 40 / 40 PASS, Mac 43 / 43 PASS (new: brush grows = redraw, twins part, told apart, schema v2, v1 upgrades).
+Checked by hand: the emulator's real v1 database upgraded in place (7 photos kept); a copy of the Mac's real database migrated with
+`integrity_check` ok; two `twin.jpg` files of 68 200 bytes got separate rows, with the same hashes on Android and Mac; editing one left
+the other alone; truncated JPEG opens, bomb PNG / empty / random bytes still refused; release APK (R8) opens library and editor.
+Not isolated: "edit, then leave within 0.3 s". The emulator renders in software (~300 ms a frame), so adb taps land seconds late.
+
+Benchmarks (`Lumen --bench <photo>`; Android debug `--ez bench true`), 6000×4000 JPEG, median of 5:
+
+| path | Mac before | Mac after | Android CPU before | Android CPU after |
+| --- | --- | --- | --- | --- |
+| brush move, 10k-point mask | 24.3 ms | 11.4 ms | 31.7 ms raster | 0.3 ms raster |
+| autosave, brushed edit | 6.3 ms (main) | 6.3 ms (main) | 53 ms on UI thread | same work, off the UI thread |
+| preview, slider move | 10.1 ms | 9.8 ms | GPU-bound | GPU-bound |
+| export full size | 156 ms | 152 ms | GPU-bound | GPU-bound |
+
+Android GPU timings aren't meaningful on this emulator (software GL under memory pressure); measure on a phone with the same command.

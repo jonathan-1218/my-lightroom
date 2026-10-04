@@ -20,6 +20,8 @@ fun Context.decode(uri: Uri, scale: (Size) -> Float): Pair<Bitmap, Size> {
         size = info.size
         d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
         d.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.SRGB))
+        // a cut-off JPEG shows what's there, as on the Mac; anything else incomplete (a header-only "bomb" PNG) is refused
+        d.setOnPartialImageListener { it.error == ImageDecoder.DecodeException.SOURCE_INCOMPLETE && info.mimeType == "image/jpeg" }
         val k = scale(info.size)
         if (k < 1) d.setTargetSize((info.size.width * k).toInt().coerceAtLeast(1), (info.size.height * k).toInt().coerceAtLeast(1))
     }

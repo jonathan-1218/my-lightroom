@@ -429,29 +429,64 @@ func bake(_ base: CGImage, _ spots: [Spot]) -> CGImage {
     return px.cgImage
 }
 
-/// A brush mask rasterised from its strokes, white = painted, at most 1024 px on the long edge, placed over the w×h source.
-private func brush(_ m: Mask, _ w: Int, _ h: Int) -> CIImage {
-    let k = min(1, 1024 / Double(max(w, h)))
-    let bw = max(1, Int((Double(w) * k).rounded())), bh = max(1, Int((Double(h) * k).rounded()))
-    let ctx = CGContext(data: nil, width: bw, height: bh, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceGray(),
+/// A brush mask, white = painted, at most 1024 px on the long edge, placed over the w×h source. While painting only the new
+/// part of the stroke is drawn (a full redraw per move slowed down as the mask grew); the feather is one blur over the result.
+/// Android's BrushRaster does the same.
+final class BrushRaster {
+    private let w: Int, h: Int, bw: Int, bh: Int
+    private let ctx: CGContext
+    private var drawn: [Stroke] = []
+    private var image: CIImage?, imageFeather: Float = -1
+
+    init(_ w: Int, _ h: Int) {
+        let k = min(1, 1024 / Double(max(w, h)))
+        self.w = w; self.h = h
+        bw = max(1, Int((Double(w) * k).rounded())); bh = max(1, Int((Double(h) * k).rounded()))
+        ctx = CGContext(data: nil, width: bw, height: bh, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceGray(),
                         bitmapInfo: CGImageAlphaInfo.none.rawValue)!
-    ctx.setFillColor(gray: 0, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: bw, height: bh))
-    ctx.translateBy(x: 0, y: CGFloat(bh)); ctx.scaleBy(x: 1, y: -1) // top-left coordinates, like the strokes
-    ctx.setLineCap(.round); ctx.setLineJoin(.round)
-    let long = Double(max(bw, bh))
-    for s in m.strokes {
+        ctx.translateBy(x: 0, y: CGFloat(bh)); ctx.scaleBy(x: 1, y: -1) // top-left coordinates, like the strokes
+        ctx.setLineCap(.round); ctx.setLineJoin(.round)
+    }
+
+    /// `s` is what is drawn plus more points on the last stroke and / or new strokes.
+    private func grows(_ s: [Stroke]) -> Bool {
+        guard let last = drawn.indices.last, s.count >= drawn.count, s[..<last] == drawn[..<last] else { return false }
+        let a = s[last], b = drawn[last]
+        return a.size == b.size && a.erase == b.erase && a.pts.starts(with: b.pts)
+    }
+
+    private func stroke(_ s: Stroke, from: Int) { // from: first float to draw; a segment starts at the point before it
+        let p = s.pts.map { Double($0) }, x = Double(bw), y = Double(bh)
         ctx.setStrokeColor(gray: s.erase ? 0 : 1, alpha: 1)
-        ctx.setLineWidth(CGFloat(Double(s.size) * long))
+        ctx.setLineWidth(CGFloat(Double(s.size) * Double(max(bw, bh))))
+        let start = max(0, from - 2)
         ctx.beginPath()
-        ctx.move(to: CGPoint(x: Double(s.pts[0]) * Double(bw), y: Double(s.pts[1]) * Double(bh)))
-        if s.pts.count == 2 { ctx.addLine(to: CGPoint(x: Double(s.pts[0]) * Double(bw) + 0.01, y: Double(s.pts[1]) * Double(bh))) }
-        for i in stride(from: 2, to: s.pts.count, by: 2) { ctx.addLine(to: CGPoint(x: Double(s.pts[i]) * Double(bw), y: Double(s.pts[i + 1]) * Double(bh))) }
+        ctx.move(to: CGPoint(x: p[start] * x, y: p[start + 1] * y))
+        if p.count == 2 { ctx.addLine(to: CGPoint(x: p[0] * x + 0.01, y: p[1] * y)) }
+        for i in stride(from: start + 2, to: p.count, by: 2) { ctx.addLine(to: CGPoint(x: p[i] * x, y: p[i + 1] * y)) }
         ctx.strokePath()
     }
-    var img = CIImage(cgImage: ctx.makeImage()!)
-    let soft = Double(m.strokes.map(\.size).max() ?? 0) * long * Double(m.feather) * 0.3
-    if soft > 0.5 { img = img.clampedToExtent().applyingGaussianBlur(sigma: soft).cropped(to: img.extent) }
-    return img.transformed(by: CGAffineTransform(scaleX: CGFloat(w) / CGFloat(bw), y: CGFloat(h) / CGFloat(bh)))
+
+    func update(_ m: Mask) -> CIImage {
+        if let image, m.strokes == drawn, m.feather == imageFeather { return image }
+        if m.strokes != drawn {
+            if grows(m.strokes) {
+                let last = drawn.count - 1
+                if m.strokes[last].pts.count > drawn[last].pts.count { stroke(m.strokes[last], from: drawn[last].pts.count) }
+                for s in m.strokes[(last + 1)...] { stroke(s, from: 0) }
+            } else {
+                ctx.setFillColor(gray: 0, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: bw, height: bh))
+                for s in m.strokes { stroke(s, from: 0) }
+            }
+            drawn = m.strokes
+        }
+        var img = CIImage(cgImage: ctx.makeImage()!)
+        let soft = Double(m.strokes.map(\.size).max() ?? 0) * Double(max(bw, bh)) * Double(m.feather) * 0.3
+        if soft > 0.5 { img = img.clampedToExtent().applyingGaussianBlur(sigma: soft).cropped(to: img.extent) }
+        img = img.transformed(by: CGAffineTransform(scaleX: CGFloat(w) / CGFloat(bw), y: CGFloat(h) / CGFloat(bh)))
+        image = img; imageFeather = m.feather
+        return img
+    }
 }
 
 /// Gaussian blur at reduced size; the radius is a fraction of the long edge so preview and export match (as on Android).
@@ -477,7 +512,7 @@ final class Look {
     private var lutImg = dummy
     private var profileFor: String?
     private var profileImg: (CIImage, Int)?
-    private var brushFor = [AnyHashable?](repeating: nil, count: MAX_MASKS)
+    private var brushes = [BrushRaster?](repeating: nil, count: MAX_MASKS)
     private var brushImg = [CIImage?](repeating: nil, count: MAX_MASKS)
     var overlay: (Double, Double, Double) = (1, 0.35, 0.35)
 
@@ -499,8 +534,7 @@ final class Look {
         if profileFor != e.profile { profileImg = Profiles.lut(e.profile); profileFor = e.profile }
         for i in 0..<MAX_MASKS {
             let m = e.masks.indices.contains(i) && e.masks[i].type == "brush" ? e.masks[i] : nil
-            let key: AnyHashable? = m.map { AnyHashable("\($0.strokes.count)|\($0.strokes.last?.pts.count ?? 0)|\($0.strokes.hashValue)|\($0.feather)") }
-            if key != brushFor[i] { brushImg[i] = m.map { brush($0, Int(w), Int(h)) }; brushFor[i] = key }
+            if let m { if brushes[i] == nil { brushes[i] = BrushRaster(Int(w), Int(h)) }; brushImg[i] = brushes[i]!.update(m) } else { brushImg[i] = nil }
         }
     }
 

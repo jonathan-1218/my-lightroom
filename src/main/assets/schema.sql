@@ -2,7 +2,8 @@
 -- Single user, app-private database: no owner columns, no row-level security.
 -- Times are UTC epoch milliseconds (SQLite has no timestamptz).
 -- An "edit" is one JSON document (see architecture.md). Originals are never written.
--- Foreign keys are switched on in Db.onConfigure. Db splits statements on semicolons, so keep them out of comments.
+-- Foreign keys are switched on in Db.onConfigure. Db splits statements at a ";" that ends a line, so keep those out of comments.
+-- Changes go in migrate_<n>.sql (both apps run them in order), never in this file.
 
 create table photos (
   id          integer primary key,

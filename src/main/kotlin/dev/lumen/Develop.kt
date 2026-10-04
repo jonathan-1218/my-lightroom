@@ -1,7 +1,6 @@
 package dev.lumen
 
 import android.graphics.Bitmap
-import android.graphics.BlurMaskFilter
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.BitmapShader
@@ -512,8 +511,8 @@ ${(0 until MAX_MASKS).joinToString("\n") { i -> """
 }
 """
 
-/** Off-screen GPU render into a software bitmap. */
-fun gpu(w: Int, h: Int, effect: RenderEffect? = null, draw: (RecordingCanvas) -> Unit): Bitmap {
+/** Off-screen GPU render into a software bitmap, or with `hardware` left on the GPU (shader inputs): no read-back, no re-upload. */
+fun gpu(w: Int, h: Int, effect: RenderEffect? = null, hardware: Boolean = false, draw: (RecordingCanvas) -> Unit): Bitmap {
     val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 1,
         HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_GPU_COLOR_OUTPUT)
     val node = RenderNode("lumen").apply { setPosition(0, 0, w, h); setRenderEffect(effect) }
@@ -522,7 +521,8 @@ fun gpu(w: Int, h: Int, effect: RenderEffect? = null, draw: (RecordingCanvas) ->
     renderer.createRenderRequest().setWaitForPresent(true).syncAndDraw()
     reader.acquireNextImage().use { img ->
         val hb = img.hardwareBuffer!!
-        val out = Bitmap.wrapHardwareBuffer(hb, ColorSpace.get(ColorSpace.Named.SRGB))!!.copy(Bitmap.Config.ARGB_8888, false)
+        val wrapped = Bitmap.wrapHardwareBuffer(hb, ColorSpace.get(ColorSpace.Named.SRGB))!! // keeps its own reference to the buffer
+        val out = if (hardware) wrapped else wrapped.copy(Bitmap.Config.ARGB_8888, false)
         hb.close()
         renderer.destroy(); reader.close()
         return out
@@ -530,11 +530,11 @@ fun gpu(w: Int, h: Int, effect: RenderEffect? = null, draw: (RecordingCanvas) ->
 }
 
 /** Gaussian blur at reduced size; radius is a fraction of the long edge so preview and export match. */
-private fun blur(src: Bitmap, frac: Float, maxLong: Int): Bitmap {
+private fun blur(src: Bitmap, frac: Float, maxLong: Int, radius: Float = frac * maxLong): Bitmap {
     val k = minOf(1f, maxLong.toFloat() / maxOf(src.width, src.height))
     val w = (src.width * k).roundToInt().coerceAtLeast(1); val h = (src.height * k).roundToInt().coerceAtLeast(1)
-    val r = (frac * maxOf(w, h)).coerceAtLeast(0.5f)
-    return gpu(w, h, RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP)) {
+    val r = (if (frac > 0) frac * maxOf(w, h) else radius).coerceAtLeast(0.5f)
+    return gpu(w, h, RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP), hardware = true) {
         it.scale(w.toFloat() / src.width, h.toFloat() / src.height)
         it.drawBitmap(src, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
     }
@@ -581,25 +581,57 @@ fun bake(base: Bitmap, spots: List<Spot>): Bitmap {
     return out
 }
 
-/** A brush mask rasterised from its strokes, white = painted. Long edge at most 1024. */
-private fun brush(m: Mask, w: Int, h: Int): Bitmap {
-    val k = minOf(1f, 1024f / maxOf(w, h))
-    val bw = (w * k).roundToInt().coerceAtLeast(1); val bh = (h * k).roundToInt().coerceAtLeast(1)
-    val b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
-    val c = Canvas(b).apply { drawColor(Color.BLACK) }
-    val long = maxOf(bw, bh)
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
-    for (s in m.strokes) {
-        paint.color = if (s.erase) Color.BLACK else Color.WHITE
-        paint.strokeWidth = s.size * long
-        paint.maskFilter = if (m.feather > 0.05f) BlurMaskFilter(s.size * long * m.feather * 0.5f, BlurMaskFilter.Blur.NORMAL) else null
-        if (s.pts.size == 2) c.drawPoint(s.pts[0] * bw, s.pts[1] * bh, paint)
-        else c.drawPath(Path().apply {
-            moveTo(s.pts[0] * bw, s.pts[1] * bh)
-            for (i in 2 until s.pts.size step 2) lineTo(s.pts[i] * bw, s.pts[i + 1] * bh)
+/** A brush mask, white = painted, long edge at most 1024. While painting only the new part of the stroke is drawn
+ *  (a full redraw per finger move slowed down as the mask grew); the feather is one GPU blur over the result, as on the Mac. */
+private class BrushRaster(w: Int, h: Int) {
+    private val k = minOf(1f, 1024f / maxOf(w, h))
+    private val bw = (w * k).roundToInt().coerceAtLeast(1); private val bh = (h * k).roundToInt().coerceAtLeast(1)
+    private val hard = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+    private val c = Canvas(hard)
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+    private var drawn: List<Stroke> = emptyList()
+    private var drawnPts = 0 // floats of drawn.last() already on the bitmap
+
+    /** True if `s` is what is drawn plus more points on the last stroke and / or new strokes. */
+    private fun grows(s: List<Stroke>): Boolean {
+        if (drawn.isEmpty() || s.size < drawn.size) return false
+        for (i in 0 until drawn.size - 1) if (s[i] !== drawn[i]) return false
+        val a = s[drawn.size - 1]; val b = drawn.last()
+        if (a !== b && (a.size != b.size || a.erase != b.erase || a.pts.size < drawnPts)) return false
+        if (a !== b) for (i in 0 until drawnPts) if (a.pts[i] != b.pts[i]) return false
+        return true
+    }
+
+    private fun stroke(st: Stroke, from: Int) { // from: first float index to draw; a segment starts at the point before it
+        paint.color = if (st.erase) Color.BLACK else Color.WHITE
+        paint.strokeWidth = st.size * maxOf(bw, bh)
+        val p = st.pts
+        if (p.size == 2) return c.drawPoint(p[0] * bw, p[1] * bh, paint)
+        val start = maxOf(0, from - 2)
+        c.drawPath(Path().apply {
+            moveTo(p[start] * bw, p[start + 1] * bh)
+            for (i in start + 2 until p.size step 2) lineTo(p[i] * bw, p[i + 1] * bh)
         }, paint)
     }
-    return b
+
+    /** The mask for `m`, sized bw×bh. */
+    fun update(m: Mask): Bitmap {
+        val s = m.strokes
+        if (grows(s)) {
+            val last = drawn.size - 1
+            if (s[last].pts.size > drawnPts) stroke(s[last], drawnPts)
+            for (i in last + 1 until s.size) stroke(s[i], 0)
+        } else {
+            c.drawColor(Color.BLACK)
+            s.forEach { stroke(it, 0) }
+        }
+        drawn = s; drawnPts = s.lastOrNull()?.pts?.size ?: 0
+        // feather: Gaussian sigma = 0.3 × brush size × feather, Skia's radius = (sigma - 0.5) / 0.57735 (Engine.swift matches)
+        val sigma = (s.maxOfOrNull { it.size } ?: 0f) * maxOf(bw, bh) * m.feather * 0.3f
+        if (sigma <= 0.5f) return hard
+        val k = minOf(1f, 3f / sigma) // a wide blur loses nothing at lower resolution: run it where sigma is 3 px
+        return blur(hard, 0f, (maxOf(bw, bh) * k).roundToInt().coerceAtLeast(1), radius = (sigma * k - 0.5f).coerceAtLeast(0f) / 0.57735f)
+    }
 }
 
 /** A photo ready to develop: the pixels (with spots baked in), its blurs, and the shader. One per photo, and per export. */
@@ -614,6 +646,7 @@ class Look(val base: Bitmap) {
     private lateinit var lutShader: BitmapShader
     private val brushFor = arrayOfNulls<Any>(MAX_MASKS)
     private val brushShader = arrayOfNulls<BitmapShader>(MAX_MASKS)
+    private val brushes = arrayOfNulls<BrushRaster>(MAX_MASKS)
     private val none by lazy { shader(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.BLACK) }) }
     var overlay = floatArrayOf(1f, 0.3f, 0.3f) // mask overlay colour, set from the tokens by the view
     private var profileFor: String? = null
@@ -644,7 +677,10 @@ class Look(val base: Bitmap) {
         for (i in 0 until MAX_MASKS) {
             val m = e.masks.getOrNull(i)?.takeIf { it.type == "brush" }
             val key = m?.let { it.strokes to it.feather }
-            if (key != brushFor[i]) { brushShader[i] = m?.let { shader(brush(it, src.width, src.height)) }; brushFor[i] = key }
+            if (key != brushFor[i]) {
+                brushShader[i] = m?.let { shader((brushes[i] ?: BrushRaster(src.width, src.height).also { r -> brushes[i] = r }).update(it)) }
+                brushFor[i] = key
+            }
         }
     }
 
@@ -705,3 +741,4 @@ class Look(val base: Bitmap) {
         return out
     }
 }
+

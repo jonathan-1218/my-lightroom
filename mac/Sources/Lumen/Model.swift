@@ -318,9 +318,3 @@ func curveFn(_ points: [CGPoint]) -> (Double) -> Double {
         return min(1, max(0, h00 * p[i].y + h10 * h * t[i] + h01 * p[i + 1].y + h11 * h * t[i + 1]))
     }
 }
-
-/// Same identity rule as Android (`name|size`), so a photo copied between phone and Mac keeps one row per device.
-func photoKey(_ url: URL) -> String {
-    let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-    return "\(url.lastPathComponent)|\(size)"
-}

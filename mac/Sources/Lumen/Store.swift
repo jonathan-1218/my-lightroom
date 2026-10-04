@@ -15,19 +15,23 @@ struct Album: Identifiable, Hashable { var id: Int64; var name: String }
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-/// The schema the Android app ships (src/main/assets/schema.sql): copied into the app bundle by build.sh,
-/// read straight from the repo when running from source.
-func schemaSQL() -> String {
-    if let u = Bundle.main.url(forResource: "schema", withExtension: "sql"), let s = try? String(contentsOf: u) { return s }
-    let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("../../../src/main/assets/schema.sql")
-    return (try? String(contentsOf: repo)) ?? ""
+/// A SQL file the Android app ships (src/main/assets): copied into the app bundle by build.sh, read from the repo when running
+/// from source. Statements end at a ";" that ends a line (trigger bodies keep theirs), comment lines are dropped, as on Android.
+func sqlFile(_ name: String) -> [String] {
+    let text = Bundle.main.url(forResource: name, withExtension: "sql").flatMap { try? String(contentsOf: $0) }
+        ?? (try? String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("../../../src/main/assets/\(name).sql")))
+        ?? ""
+    let lines = text.split(separator: "\n").map { $0.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression) }
+    return (lines.filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("--") }.joined(separator: "\n") + "\n")
+        .components(separatedBy: ";\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
 }
 
 /// App-private SQLite, same tables and edit JSON as the Android app. `path = nil` gives an in-memory DB (self-test).
 final class Db {
     private var db: OpaquePointer?
 
-    static let version = 1 // bump with a migrate_<n>.sql when schema.sql changes (same number as Android's SQLiteOpenHelper)
+    static let version = 2 // schema.sql is v1; migrate_<n>.sql takes it to n (the same files and number as Android)
+    static let told = "*|" + String(repeating: "[0-9a-f]", count: 16) // a key from told()
 
     init(path: String? = Db.defaultPath) {
         // serialized: one handle shared by the main thread and background work
@@ -35,16 +39,17 @@ final class Db {
             fatalError("Lumen can't open its database at \(path ?? "memory")")
         }
         exec("pragma foreign_keys = on")
-        let v = query("pragma user_version") { $0.int(0) }.first ?? 0
+        var v = Int(query("pragma user_version") { $0.int(0) }.first ?? 0)
         let exists = (query("select count(*) from sqlite_master where name = 'photos'") { $0.int(0) }.first ?? 0) > 0
-        if v == 0 && !exists { // first run: the whole schema or nothing
-            let sql = schemaSQL().split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("--") }.joined(separator: "\n")
-            let statements = sql.split(separator: ";").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-            guard !statements.isEmpty else { fatalError("schema.sql is missing from the app; rebuild with build.sh") }
-            let ok = tx { statements.allSatisfy { exec($0) } }
-            guard ok else { fatalError("Lumen couldn't create its database") }
+        if v == 0 && exists { v = 1 } // made before user_version was set
+        guard v < Db.version else { return }
+        // first run: the whole schema, then every migration; later: the migrations it hasn't had. All of it or nothing.
+        let files = (v == 0 ? ["schema"] : []) + (max(v, 1) + 1...Db.version).map { "migrate_\($0)" }
+        let steps = files.map(sqlFile)
+        guard steps.allSatisfy({ !$0.isEmpty }) else { fatalError("\(files.joined(separator: ", ")).sql missing from the app; rebuild with build.sh") }
+        guard tx({ steps.joined().allSatisfy { exec($0) } && exec("pragma user_version = \(Db.version)") }) else {
+            fatalError("Lumen couldn't update its database")
         }
-        if v == 0 { exec("pragma user_version = \(Db.version)") }
     }
 
     /// All-or-nothing: on failure nothing is written. Batch work also runs much faster inside one.
@@ -105,11 +110,25 @@ final class Db {
 
     private var now: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
-    /// The photo's row, created on first open.
-    func open(key: String, uri: String, w: Int, h: Int) -> Row {
+    private func has(_ key: String) -> Bool { !query("select 1 from photos where key = ?", [key], { $0.int(0) }).isEmpty }
+
+    /// Plain name|size keys whose files were told apart: they keep hashed keys even after one of the twins is gone.
+    func split() -> Set<String> { Set(query("select substr(key, 1, length(key) - 17) from photos where key glob ?", [Db.told]) { $0.text(0)! }) }
+
+    /// The photo's row, created on first open. `shared` is the plain name|size key when `key` tells apart files sharing it.
+    func open(key: String, uri: String, w: Int, h: Int, shared: String? = nil) -> Row {
         // Same file under a new key (its size changed, e.g. another app rewrote the metadata): keep its edits.
-        if query("select 1 from photos where key = ?", [key], { $0.int(0) }).isEmpty {
-            exec("update photos set key = ? where uri = ? and not exists (select 1 from photos where key = ?)", [key, uri, key])
+        if !has(key) { exec("update photos set key = ? where uri = ? and not exists (select 1 from photos where key = ?)", [key, uri, key]) }
+        // Two files with one name and size used to share a row. The first told apart takes it (versions, albums);
+        // the others start from a copy of it, so each keeps what it showed.
+        if !has(key), let shared, shared != key {
+            if has(shared) { exec("update photos set key = ? where key = ?", [key, shared]) }
+            else {
+                exec("""
+                    insert into photos (key, uri, added_at, updated_at, width, height, rating, flag, label, edit) select ?, ?, ?, ?, ?, ?, rating, flag, label, edit
+                    from photos where substr(key, 1, length(?) + 1) = ? || '|' limit 1
+                    """, [key, uri, now, now, max(1, w), max(1, h), shared, shared])
+            }
         }
         exec("""
             insert into photos (key, uri, added_at, updated_at, width, height) values (?,?,?,?,?,?) on conflict (key) do update set uri = excluded.uri,
@@ -172,16 +191,24 @@ final class Db {
 
 struct Photo: Identifiable, Hashable {
     let url: URL
-    let key: String
+    var key: String
     let date: Date
-    var id: String { url.path } // two different files can share a key (same name and size): both still show
+    var shared: String? // the plain name|size key, when another file has it too and `key` tells this one apart
+    var id: String { url.path }
+}
+
+/// `key|` + a hash of the file's first 64 KB (its EXIF): different photos with one name and size part, copies still match.
+/// Same rule and hash as Android's told().
+func told(_ key: String, _ url: URL) -> String {
+    let head = (try? FileHandle(forReadingFrom: url)).flatMap { f in defer { try? f.close() }; return try? f.read(upToCount: 64 << 10) }
+    return key + "|" + String((head.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() } ?? sha256(url.path)).prefix(16))
 }
 
 let imageTypes: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
                                "raf", "orf", "rw2", "pef", "srw", "x3f", "3fr", "iiq", "erf", "mos", "mrw", "dcr", "kdc"]
 
-/// Every photo under the folders, newest first.
-func scan(_ folders: [URL]) -> [Photo] {
+/// Every photo under the folders, newest first. Files sharing a name and size (or told apart before: `split`) get keys of their own.
+func scan(_ folders: [URL], split: Set<String> = []) -> [Photo] {
     var out = [Photo](), seen = Set<String>() // file paths
     let keys: [URLResourceKey] = [.fileSizeKey, .creationDateKey, .contentModificationDateKey, .isRegularFileKey]
     for folder in folders {
@@ -192,6 +219,8 @@ func scan(_ folders: [URL]) -> [Photo] {
             if seen.insert(url.standardizedFileURL.path).inserted { out.append(Photo(url: url, key: key, date: v?.creationDate ?? v?.contentModificationDate ?? .distantPast)) }
         }
     }
+    let twins = Set(Dictionary(grouping: out, by: \.key).filter { $0.value.count > 1 }.keys).union(split)
+    for i in out.indices where twins.contains(out[i].key) { out[i].shared = out[i].key; out[i].key = told(out[i].key, out[i].url) }
     return out.sorted { $0.date > $1.date }
 }
 
