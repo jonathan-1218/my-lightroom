@@ -6,16 +6,16 @@ Undo / redo history,edit,must,yes,yes,in memory per editing session; Ctrl+Z / Ct
 Before / after,edit,must,yes,yes,press and hold
 Exposure contrast highlights shadows whites blacks,light,must,yes,yes,
 Temp tint vibrance saturation,color,must,yes,yes,
-Tone curve (RGB + per channel),light,must,yes,no,256-entry LUT texture
-Color mixer (HSL per 8 hues),color,must,yes,no,
+Tone curve (RGB + per channel),light,must,yes,yes,own Curve tab; monotone cubic so points never overshoot
+Color mixer (HSL per 8 hues),color,must,yes,yes,8 hue bands; saturation desaturates toward luminance
 Color grading (shadows/mid/highlights wheels),color,should,yes,no,
-Texture clarity dehaze,effects,must,yes,no,needs blur pass
+Texture clarity dehaze,effects,must,yes,yes,blurs are normalised so preview and export match
 Vignette,effects,must,yes,yes,
 Grain,effects,should,yes,no,
-Sharpening,detail,must,yes,no,
+Sharpening,detail,must,yes,yes,4-tap unsharp in source pixels; preview at 2048px shows it softer than export
 Noise reduction (classic),detail,should,yes,no,bilateral shader; not AI Denoise
-Crop with aspect presets,crop,must,yes,no,
-Straighten rotate flip,crop,must,yes,no,
+Crop with aspect presets,crop,must,yes,yes,Free / Original / 1:1 / 4:5 / 16:9 follow the frame orientation
+Straighten rotate flip,crop,must,yes,yes,crop auto-shrinks to stay inside the straightened photo
 Manual perspective (vertical/horizontal),geometry,should,yes,no,
 Guided / auto Upright,geometry,could,yes,no,line detection
 Manual lens distortion + chromatic aberration,optics,should,yes,no,
@@ -23,8 +23,8 @@ Lens profile corrections,optics,could,yes,no,needs a lens database (lensfun data
 Auto settings,light,should,yes,no,from histogram
 Histogram,edit,should,yes,no,
 Profiles (Color / Mono / creative LUTs),profiles,should,yes,no,.cube import as 3D LUT
-Presets: create apply import,presets,must,yes,no,
-Copy / paste edits,presets,must,yes,no,
+Presets: create apply import,presets,must,yes,partial,6 built-in + save/delete; no import of other apps' preset files
+Copy / paste edits,presets,must,yes,yes,copies everything except crop; lasts while the app process lives
 Batch apply to selected photos,presets,should,yes,no,
 Linear gradient mask,masking,should,yes,no,
 Radial gradient mask,masking,should,yes,no,
@@ -36,16 +36,16 @@ Heal and clone brush,retouch,should,yes,no,
 Content-aware remove,retouch,could,yes,no,PatchMatch on CPU
 Blemish / dust spot auto-remove,retouch,could,yes,no,
 Versions (named snapshots),library,should,yes,no,
-Ratings flags color labels,library,must,yes,no,
+Ratings flags color labels,library,must,yes,yes,editor Rate tab + 0-5/P/X/U keys; badges on library cells
 Albums,library,should,yes,no,
 Filter and search by rating/flag/date,library,should,yes,no,
 Export JPEG with quality and size,export,must,yes,partial,JPEG 95 only today
 Export PNG / TIFF / original,export,should,yes,no,framework encodes PNG; TIFF needs a writer
 Keep EXIF on export,export,must,yes,partial,dates camera lens exposure copied; GPS dropped (needs ACCESS_MEDIA_LOCATION)
-Full-resolution export beyond 4096px,export,must,yes,no,tiled render
+Full-resolution export beyond 4096px,export,must,yes,yes,2048px tiles; 6000x4000 source tested
 Watermark,export,could,yes,no,
 Share to other apps,export,should,yes,no,
-DNG RAW,import,must,yes,partial,ImageDecoder decodes DNG; untested
+DNG RAW,import,must,yes,partial,ImageDecoder decodes DNG; still untested (no sample on hand)
 Proprietary RAW (CR3 NEF ARW),import,could,yes,no,needs LibRaw native lib
 HDR editing and Ultra HDR export,hdr,could,yes,no,gainmap API 34+
 Lens blur (AI depth),effects,could,yes,skip,needs depth model

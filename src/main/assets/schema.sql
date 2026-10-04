@@ -52,3 +52,12 @@ create table album_photos (
   primary key (album_id, photo_id)
 );
 create index album_photos_photo on album_photos (photo_id);
+
+-- Built-in presets. Each sets only the keys it names, the rest of the photo's edit stays.
+insert into presets (name, edit, created_at, updated_at) values
+  ('Crisp',      '{"v":1,"light":{"contrast":0.2},"color":{"vibrance":0.2},"effects":{"clarity":0.25},"detail":{"sharpen":0.3}}', 1, 1),
+  ('Soft light', '{"v":1,"light":{"contrast":-0.15,"highlights":-0.3,"shadows":0.3},"effects":{"clarity":-0.15}}', 2, 2),
+  ('Golden',     '{"v":1,"color":{"temp":0.35,"tint":0.05,"vibrance":0.15}}', 3, 3),
+  ('Cool',       '{"v":1,"color":{"temp":-0.3,"saturation":-0.05}}', 4, 4),
+  ('Mono',       '{"v":1,"light":{"contrast":0.2},"color":{"saturation":-1,"vibrance":0},"effects":{"clarity":0.15}}', 5, 5),
+  ('Faded',      '{"v":1,"light":{"contrast":-0.1},"color":{"saturation":-0.2},"curve":{"rgb":[[0,0.12],[1,0.92]]}}', 6, 6)

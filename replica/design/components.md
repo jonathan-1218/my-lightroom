@@ -28,3 +28,18 @@ Photo preview (EditView)
   a11y      contentDescription explains touch-and-hold
 
 Not built yet (they come with their screens): library grid cell, crop handles, mask pins, histogram, export sheet, icons.
+
+CurveView
+  parts     4×4 grid (border), curve (text / label-red / label-green / label-blue per channel), points (same colour)
+  gestures  tap empty space = add point, drag = move, double-tap = remove; end points move vertically only
+  a11y      contentDescription points to "Reset curve"; not adjustable by TalkBack (gap: no per-point controls)
+  used on   Curve tab, one tab of its own so the panel never scrolls under a drag
+
+Crop frame (EditView crop mode)
+  parts     scrim outside the frame, 1dp frame + thirds (text), 7dp handles (accent), photo inset 24dp
+  gestures  drag a corner (aspect-locked if a ratio chip is on), drag inside to move; always clamped inside the photo
+  used on   Crop tab
+
+Library cell marks
+  parts     ★ × rating (text, shadow), ⚑ when picked, label dot (label-*), scrim over rejects
+  a11y      contentDescription adds "4 stars, picked, blue"

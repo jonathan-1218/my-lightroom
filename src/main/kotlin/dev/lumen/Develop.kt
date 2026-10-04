@@ -1,0 +1,356 @@
+package dev.lumen
+
+import android.graphics.Bitmap
+import android.graphics.BitmapShader
+import android.graphics.Canvas
+import android.graphics.ColorSpace
+import android.graphics.HardwareRenderer
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.RecordingCanvas
+import android.graphics.RectF
+import android.graphics.RenderEffect
+import android.graphics.RenderNode
+import android.graphics.RuntimeShader
+import android.graphics.Shader
+import android.hardware.HardwareBuffer
+import android.media.ImageReader
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.math.roundToInt
+
+// The edit document (replica/architecture.md). Every slider value is -1..1, 0 = untouched.
+val HUES = listOf("red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta")
+val SECTIONS = linkedMapOf(
+    "light" to listOf("exposure", "contrast", "highlights", "shadows", "whites", "blacks"),
+    "color" to listOf("temp", "tint", "vibrance", "saturation"),
+    "mixer" to HUES.flatMap { listOf("${it}Hue", "${it}Sat", "${it}Lum") },
+    "effects" to listOf("texture", "clarity", "dehaze", "vignette"),
+    "detail" to listOf("sharpen"),
+    "geometry" to listOf("straighten"), // ±1 = ±45°
+)
+val SLIDERS = SECTIONS.values.flatten()
+private val IDX = SLIDERS.withIndex().associate { it.value to it.index }
+private val SCALARS = SECTIONS.filterKeys { it != "mixer" && it != "geometry" }.values.flatten()
+val CHANNELS = listOf("rgb", "r", "g", "b")
+val LINE = listOf(0f to 0f, 1f to 1f)
+
+class Edit {
+    val v = FloatArray(SLIDERS.size)
+    var curves: List<List<Pair<Float, Float>>> = List(4) { LINE } // rgb, r, g, b
+    var crop = RectF(0f, 0f, 1f, 1f) // normalised to the rotated (oriented) image
+    var rot90 = 0
+    var flipH = false
+
+    operator fun get(n: String) = v[IDX.getValue(n)]
+    operator fun set(n: String, x: Float) { v[IDX.getValue(n)] = x }
+
+    fun copy() = Edit().also { e ->
+        v.copyInto(e.v); e.curves = curves; e.crop = RectF(crop); e.rot90 = rot90; e.flipH = flipH
+    }
+
+    fun toJson(geometry: Boolean = true): String = JSONObject().put("v", 1).apply {
+        SECTIONS.forEach { (s, names) ->
+            if (s != "geometry") put(s, JSONObject().apply { names.forEach { put(it, this@Edit[it].toDouble()) } })
+        }
+        put("curve", JSONObject().apply {
+            CHANNELS.forEachIndexed { i, ch -> put(ch, JSONArray(curves[i].map { (x, y) -> JSONArray(listOf(x.toDouble(), y.toDouble())) })) }
+        })
+        if (geometry) put("geometry", JSONObject()
+            .put("straighten", this@Edit["straighten"].toDouble())
+            .put("crop", JSONArray(listOf(crop.left, crop.top, crop.right, crop.bottom).map { it.toDouble() }))
+            .put("rot90", rot90).put("flipH", flipH))
+    }.toString()
+
+    /** Overlay whatever keys `json` has (a preset sets only what it names). Geometry only when asked. */
+    fun merge(json: String, geometry: Boolean = true): Edit = apply {
+        val o = JSONObject(json)
+        SECTIONS.forEach { (s, names) ->
+            if (s == "geometry") return@forEach
+            val sec = o.optJSONObject(s) ?: return@forEach
+            names.forEach { if (sec.has(it)) set(it, sec.getDouble(it).toFloat()) }
+        }
+        o.optJSONObject("curve")?.let { c ->
+            curves = CHANNELS.mapIndexed { i, ch ->
+                c.optJSONArray(ch)?.let { a -> (0 until a.length()).map { a.getJSONArray(it).let { p -> p.getDouble(0).toFloat() to p.getDouble(1).toFloat() } } }
+                    ?.takeIf { it.size >= 2 } ?: curves[i]
+            }
+        }
+        val g = o.optJSONObject("geometry")
+        if (geometry && g != null) {
+            if (g.has("straighten")) set("straighten", g.getDouble("straighten").toFloat())
+            g.optJSONArray("crop")?.let { crop = RectF(it.getDouble(0).toFloat(), it.getDouble(1).toFloat(), it.getDouble(2).toFloat(), it.getDouble(3).toFloat()) }
+            rot90 = g.optInt("rot90", rot90)
+            flipH = g.optBoolean("flipH", flipH)
+        }
+    }
+
+    // ---- geometry: rotate 90s, then mirror, then straighten, then crop ----
+
+    fun oriented(w: Int, h: Int) = if (rot90 % 2 == 1) h to w else w to h
+    fun degrees() = get("straighten") * 45f
+
+    /** Source pixels → output pixels. Without crop: the whole straightened image (crop mode). */
+    fun matrix(w: Int, h: Int, withCrop: Boolean = true): Matrix {
+        val (ow, oh) = oriented(w, h)
+        return Matrix().apply {
+            setRotate(90f * rot90, w / 2f, h / 2f)
+            postTranslate((ow - w) / 2f, (oh - h) / 2f)
+            if (flipH) postScale(-1f, 1f, ow / 2f, oh / 2f)
+            postRotate(degrees(), ow / 2f, oh / 2f)
+            if (withCrop) postTranslate(-crop.left * ow, -crop.top * oh)
+        }
+    }
+
+    fun outSize(w: Int, h: Int): Pair<Int, Int> {
+        val (ow, oh) = oriented(w, h)
+        return (crop.width() * ow).roundToInt().coerceAtLeast(1) to (crop.height() * oh).roundToInt().coerceAtLeast(1)
+    }
+
+    /** Is this crop (normalised, in an ow×oh oriented frame) fully inside the straightened photo? */
+    fun fits(r: RectF, ow: Int, oh: Int): Boolean {
+        val pts = floatArrayOf(r.left * ow, r.top * oh, r.right * ow, r.top * oh, r.right * ow, r.bottom * oh, r.left * ow, r.bottom * oh)
+        Matrix().apply { setRotate(-degrees(), ow / 2f, oh / 2f) }.mapPoints(pts)
+        val e = 1e-3f * maxOf(ow, oh)
+        return (pts.indices step 2).all { pts[it] in -e..ow + e && pts[it + 1] in -e..oh + e }
+    }
+
+    /** Largest scale of `r` about its centre that fits. Straightening shrinks the crop like this. */
+    fun shrinkToFit(r: RectF, ow: Int, oh: Int): RectF {
+        if (fits(r, ow, oh)) return r
+        var lo = 0f; var hi = 1f
+        repeat(20) { val m = (lo + hi) / 2; if (fits(scaled(r, m), ow, oh)) lo = m else hi = m }
+        return scaled(r, lo)
+    }
+
+    private fun scaled(r: RectF, s: Float) = RectF(
+        r.centerX() - r.width() * s / 2, r.centerY() - r.height() * s / 2,
+        r.centerX() + r.width() * s / 2, r.centerY() + r.height() * s / 2)
+
+    fun rotateRight() {
+        rot90 = (rot90 + if (flipH) 3 else 1) % 4 // mirrored: turning the picture right is a left turn of the source
+        crop = RectF(1 - crop.bottom, crop.left, 1 - crop.top, crop.right)
+    }
+
+    fun flip() {
+        flipH = !flipH
+        crop = RectF(1 - crop.right, crop.top, 1 - crop.left, crop.bottom)
+        set("straighten", -get("straighten"))
+    }
+}
+
+// ---- tone curve: monotone cubic (Fritsch–Carlson), so dragging a point never makes the curve overshoot ----
+
+fun curveFn(points: List<Pair<Float, Float>>): (Float) -> Float {
+    val p = points.sortedBy { it.first }
+    val n = p.size
+    val m = FloatArray(n - 1) { (p[it + 1].second - p[it].second) / maxOf(p[it + 1].first - p[it].first, 1e-6f) }
+    val t = FloatArray(n) { i ->
+        when (i) { 0 -> m[0]; n - 1 -> m[n - 2]; else -> if (m[i - 1] * m[i] <= 0) 0f else (m[i - 1] + m[i]) / 2 }
+    }
+    for (i in 0 until n - 1) {
+        if (m[i] == 0f) { t[i] = 0f; t[i + 1] = 0f; continue }
+        val a = t[i] / m[i]; val b = t[i + 1] / m[i]; val s = a * a + b * b
+        if (s > 9) { val k = 3 / kotlin.math.sqrt(s); t[i] = k * a * m[i]; t[i + 1] = k * b * m[i] }
+    }
+    return { x ->
+        when {
+            x <= p[0].first -> p[0].second
+            x >= p[n - 1].first -> p[n - 1].second
+            else -> {
+                val i = (0 until n - 1).first { x <= p[it + 1].first }
+                val h = p[i + 1].first - p[i].first; val u = (x - p[i].first) / h
+                val h00 = (1 + 2 * u) * (1 - u) * (1 - u); val h10 = u * (1 - u) * (1 - u)
+                val h01 = u * u * (3 - 2 * u); val h11 = u * u * (u - 1)
+                (h00 * p[i].second + h10 * h * t[i] + h01 * p[i + 1].second + h11 * h * t[i + 1]).coerceIn(0f, 1f)
+            }
+        }
+    }
+}
+
+/** 256×1 lookup: per channel, channel curve after the RGB curve. */
+// ponytail: 8-bit LUT matches the 8-bit output; switch to RGBA_F16 if curves band on 10-bit exports
+private fun lut(curves: List<List<Pair<Float, Float>>>): Bitmap {
+    val (all, r, g, b) = curves.map(::curveFn)
+    val px = IntArray(256) { i ->
+        val y = all(i / 255f)
+        fun c(f: (Float) -> Float) = (f(y) * 255).roundToInt()
+        (0xFF shl 24) or (c(r) shl 16) or (c(g) shl 8) or c(b)
+    }
+    return Bitmap.createBitmap(px, 256, 1, Bitmap.Config.ARGB_8888)
+}
+
+// ---- the shader: one GPU pass, preview and export ----
+
+private val AGSL = """
+uniform shader img;
+uniform shader blurS;
+uniform shader blurL;
+uniform shader lut;
+uniform float3x3 toOut;
+${SCALARS.joinToString("\n") { "uniform float u_$it;" }}
+uniform float4 hueA; uniform float4 hueB;
+uniform float4 satA; uniform float4 satB;
+uniform float4 lumA; uniform float4 lumB;
+const float3 W = float3(0.2126, 0.7152, 0.0722);
+
+float3 hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = mix(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+    float4 q = mix(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + 1e-10)), d / (q.x + 1e-10), q.x);
+}
+float3 rgb(float3 c) {
+    float3 p = abs(fract(c.xxx + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return c.z * mix(float3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+}
+// Triangular weight around hue centre c, zero outside l..r. The 8 bands sum to 1 at any hue.
+float tri(float h, float l, float c, float r) { return clamp(h < c ? (h - l) / (c - l) : (r - h) / (r - c), 0.0, 1.0); }
+float band(float4 a, float4 b, float h) {
+    float hr = h > 180.0 ? h - 360.0 : h;
+    return a.x * tri(hr, -60.0, 0.0, 30.0) + a.y * tri(h, 0.0, 30.0, 60.0) + a.z * tri(h, 30.0, 60.0, 120.0)
+         + a.w * tri(h, 60.0, 120.0, 180.0) + b.x * tri(h, 120.0, 180.0, 240.0) + b.y * tri(h, 180.0, 240.0, 270.0)
+         + b.z * tri(h, 240.0, 270.0, 300.0) + b.w * tri(h, 270.0, 300.0, 360.0);
+}
+float3 curve(float3 x) {
+    x = clamp(x, 0.0, 1.0) * 255.0 + 0.5;
+    return float3(lut.eval(float2(x.r, 0.5)).r, lut.eval(float2(x.g, 0.5)).g, lut.eval(float2(x.b, 0.5)).b);
+}
+
+half4 main(float2 p) {
+    half4 c = img.eval(p);
+    float3 x = float3(c.rgb);
+    if (u_sharpen > 0.0) {
+        float3 n = float3(img.eval(p + float2(1.0, 0.0)).rgb + img.eval(p - float2(1.0, 0.0)).rgb
+                        + img.eval(p + float2(0.0, 1.0)).rgb + img.eval(p - float2(0.0, 1.0)).rgb) * 0.25;
+        x += 1.5 * u_sharpen * (x - n);
+    }
+    float3 bs = float3(blurS.eval(p).rgb);
+    float3 bl = float3(blurL.eval(p).rgb);
+    float dS = dot(x, W) - dot(bs, W);
+    float dL = dot(x, W) - dot(bl, W);
+
+    float haze = min(bl.r, min(bl.g, bl.b)); // dark-channel estimate from the large blur
+    if (u_dehaze > 0.0) { x = (x - 0.95) / max(1.0 - 0.8 * u_dehaze * haze, 0.25) + 0.95; }
+    else { x = mix(x, float3(0.85), -0.4 * u_dehaze); }
+
+    x = pow(max(x, 0.0), float3(2.2)); // ponytail: gamma 2.2 approximates sRGB, exact curve if banding shows
+    x *= exp2(2.0 * u_exposure) * float3(1.0 + 0.3 * u_temp, 1.0 - 0.3 * u_tint, 1.0 - 0.3 * u_temp);
+    x = pow(max(x, 0.0), float3(1.0 / 2.2));
+    float bp = -0.15 * u_blacks;
+    float wp = 1.0 - 0.15 * u_whites;
+    x = (x - bp) / (wp - bp);
+    float L = dot(x, W);
+    float d = 0.3 * u_shadows * (1.0 - smoothstep(0.0, 0.6, L)) + 0.3 * u_highlights * smoothstep(0.4, 1.0, L);
+    x *= (L + d) / max(L, 0.001);
+
+    L = clamp(dot(x, W), 0.0, 1.0);
+    float mid = 1.0 - (2.0 * L - 1.0) * (2.0 * L - 1.0);
+    x += 1.5 * u_texture * dS + 1.2 * u_clarity * dL * mid;
+    x = (x - 0.5) * (1.0 + 0.6 * u_contrast) + 0.5;
+    x = curve(x);
+
+    L = dot(x, W);
+    float s = max(x.r, max(x.g, x.b)) - min(x.r, min(x.g, x.b));
+    x = mix(float3(L), x, (1.0 + u_saturation) * (1.0 + u_vibrance * (1.0 - s)));
+
+    float3 h = hsv(clamp(x, 0.0, 1.0));
+    float deg = h.x * 360.0;
+    float chroma = h.y;
+    h.x = fract(h.x + band(hueA, hueB, deg) * 30.0 / 360.0 + 1.0);
+    x = rgb(h);
+    x = mix(float3(dot(x, W)), x, 1.0 + band(satA, satB, deg)); // toward luminance, so -100 gives the right grey
+    x *= 1.0 + 0.5 * band(lumA, lumB, deg) * chroma;
+
+    float2 q = (toOut * float3(p, 1.0)).xy; // 0..1 across the cropped output
+    x *= 1.0 + 0.8 * u_vignette * smoothstep(0.4, 1.1, length(q - 0.5) * 1.414);
+    return half4(half3(clamp(x, 0.0, 1.0)), c.a);
+}
+"""
+
+/** Off-screen GPU render into a software bitmap. */
+fun gpu(w: Int, h: Int, effect: RenderEffect? = null, draw: (RecordingCanvas) -> Unit): Bitmap {
+    val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 1,
+        HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_GPU_COLOR_OUTPUT)
+    val node = RenderNode("lumen").apply { setPosition(0, 0, w, h); setRenderEffect(effect) }
+    draw(node.beginRecording(w, h)); node.endRecording()
+    val renderer = HardwareRenderer().apply { setSurface(reader.surface); setContentRoot(node) }
+    renderer.createRenderRequest().setWaitForPresent(true).syncAndDraw()
+    reader.acquireNextImage().use { img ->
+        val hb = img.hardwareBuffer!!
+        val out = Bitmap.wrapHardwareBuffer(hb, ColorSpace.get(ColorSpace.Named.SRGB))!!.copy(Bitmap.Config.ARGB_8888, false)
+        hb.close()
+        renderer.destroy(); reader.close()
+        return out
+    }
+}
+
+/** Gaussian blur at reduced size; radius is a fraction of the long edge so preview and export match. */
+private fun blur(src: Bitmap, frac: Float, maxLong: Int): Bitmap {
+    val k = minOf(1f, maxLong.toFloat() / maxOf(src.width, src.height))
+    val w = (src.width * k).roundToInt().coerceAtLeast(1); val h = (src.height * k).roundToInt().coerceAtLeast(1)
+    val r = (frac * maxOf(w, h)).coerceAtLeast(0.5f)
+    return gpu(w, h, RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP)) {
+        it.scale(w.toFloat() / src.width, h.toFloat() / src.height)
+        it.drawBitmap(src, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+    }
+}
+
+/** A photo ready to develop: the pixels, its blurs, and the shader. Build one per photo (and per export). */
+class Look(val src: Bitmap) {
+    private val blurS = blur(src, 0.004f, 1024)
+    private val blurL = blur(src, 0.03f, 512)
+    private val fx = RuntimeShader(AGSL)
+    private val paint = Paint().apply { shader = fx }
+    private var lutFor: Any? = null
+    private lateinit var lutShader: BitmapShader
+
+    private fun shader(b: Bitmap) = BitmapShader(b, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply {
+        filterMode = BitmapShader.FILTER_MODE_LINEAR
+        if (b !== src) setLocalMatrix(Matrix().apply { setScale(src.width.toFloat() / b.width, src.height.toFloat() / b.height) })
+    }
+
+    /** Draws `e` in output pixels (or the uncropped straightened frame when `withCrop` is false). */
+    fun draw(c: Canvas, e: Edit, withCrop: Boolean = true) {
+        val w = src.width; val h = src.height
+        val (ow, oh) = if (withCrop) e.outSize(w, h) else e.oriented(w, h)
+        val m = e.matrix(w, h, withCrop)
+        if (lutFor != e.curves) { // the LUT is sampled in its own 256×1 pixel space, never scaled to the photo
+            lutShader = BitmapShader(lut(e.curves), Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply { filterMode = BitmapShader.FILTER_MODE_LINEAR }
+            lutFor = e.curves
+        }
+        fx.setInputShader("img", shader(src))
+        fx.setInputShader("blurS", shader(blurS))
+        fx.setInputShader("blurL", shader(blurL))
+        fx.setInputShader("lut", lutShader)
+        val v = FloatArray(9); Matrix(m).apply { postScale(1f / ow, 1f / oh) }.getValues(v)
+        fx.setFloatUniform("toOut", floatArrayOf(v[0], v[3], v[6], v[1], v[4], v[7], v[2], v[5], v[8])) // column-major
+        SCALARS.forEach { fx.setFloatUniform("u_$it", e[it]) }
+        listOf("hue" to "Hue", "sat" to "Sat", "lum" to "Lum").forEach { (u, k) ->
+            val x = HUES.map { e["$it$k"] }
+            fx.setFloatUniform("${u}A", x[0], x[1], x[2], x[3])
+            fx.setFloatUniform("${u}B", x[4], x[5], x[6], x[7])
+        }
+        c.save()
+        c.clipRect(0f, 0f, ow.toFloat(), oh.toFloat())
+        c.concat(m)
+        c.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+        c.restore()
+    }
+
+    /** Full-size output, rendered in tiles so no single GPU target exceeds `tile`². */
+    // ponytail: the source is still one texture, fine to ~16k px; BitmapRegionDecoder per tile beyond that
+    fun render(e: Edit, tile: Int = 2048): Bitmap {
+        val (ow, oh) = e.outSize(src.width, src.height)
+        val out = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        for (y in 0 until oh step tile) for (x in 0 until ow step tile) {
+            val t = gpu(minOf(tile, ow - x), minOf(tile, oh - y)) { it.translate(-x.toFloat(), -y.toFloat()); draw(it, e) }
+            c.drawBitmap(t, x.toFloat(), y.toFloat(), null)
+            t.recycle()
+        }
+        return out
+    }
+}

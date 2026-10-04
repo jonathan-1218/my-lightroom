@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager.PERMISSION_GRANTED
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -28,12 +30,29 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.concurrent.Executors
 
-private class Photo(val uri: Uri, val takenAt: Long)
+private class Photo(val uri: Uri, val takenAt: Long, val key: String)
 
-/** Square grid cell. */
+/** Square grid cell with its marks: stars, pick flag, colour label; rejects are dimmed. */
 private class Cell(ctx: Context) : ImageView(ctx) {
+    var mark: Row? = null
+    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Ui.color("text"); textSize = Ui.dp(12).toFloat(); setShadowLayer(Ui.dp(2).toFloat(), 0f, 0f, Ui.color("bg"))
+    }
+    private val dot = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val scrim = Paint().apply { color = Ui.color("scrim") }
+
     init { scaleType = ScaleType.CENTER_CROP; setBackgroundColor(Ui.color("surface")) } // not focusable: GridView owns focus, a focusable child swallows item clicks
     override fun onMeasure(w: Int, h: Int) = super.onMeasure(w, w)
+
+    override fun onDraw(c: Canvas) {
+        super.onDraw(c)
+        val m = mark ?: return
+        val pad = Ui.dp(6).toFloat()
+        if (m.flag < 0) c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), scrim)
+        if (m.rating > 0) c.drawText("★".repeat(m.rating), pad, height - pad, text)
+        if (m.flag > 0) c.drawText("⚑", pad, pad - text.ascent(), text)
+        m.label?.let { dot.color = Ui.color("label-$it"); c.drawCircle(width - pad * 2, pad * 2, pad, dot) }
+    }
 }
 
 /** S01: every photo on the phone, newest first. Tap one to edit it. */
@@ -44,6 +63,8 @@ class LibraryActivity : Activity() {
         override fun sizeOf(k: Uri, b: Bitmap) = b.allocationByteCount
     }
     private var photos = listOf<Photo>()
+    private var marks = mapOf<String, Row>()
+    private val db by lazy { Db(this) }
     private var asked = false
     private lateinit var grid: GridView
     private lateinit var state: LinearLayout
@@ -107,24 +128,27 @@ class LibraryActivity : Activity() {
         }
         pool.execute {
             val list = runCatching { query() }.getOrNull()
+            val m = runCatching { db.marks() }.getOrDefault(emptyMap())
             runOnUiThread {
                 when {
                     list == null -> show("Couldn't read your photos.", "Try again") { refresh() }
                     list.isEmpty() -> show("No photos here yet. Take one, or pick one from another app.", "Pick a photo") { pick() }
-                    else -> { photos = list; (grid.adapter as BaseAdapter).notifyDataSetChanged(); show(null) }
+                    else -> { photos = list; marks = m; (grid.adapter as BaseAdapter).notifyDataSetChanged(); show(null) }
                 }
             }
         }
     }
 
     private fun query(): List<Photo> {
-        val cols = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_TAKEN, MediaStore.Images.Media.DATE_ADDED)
+        val cols = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_TAKEN, MediaStore.Images.Media.DATE_ADDED,
+            MediaStore.Images.Media.DISPLAY_NAME, MediaStore.Images.Media.SIZE)
         return contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cols, null, null,
             "${MediaStore.Images.Media.DATE_ADDED} DESC")!!.use { c ->
             buildList {
                 while (c.moveToNext()) {
                     val taken = if (c.isNull(1)) c.getLong(2) * 1000 else c.getLong(1)
-                    add(Photo(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0)), taken))
+                    val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
+                    add(Photo(uri, taken, key(c.getString(3), c.getLong(4), uri)))
                 }
             }
         }
@@ -161,7 +185,12 @@ class LibraryActivity : Activity() {
             val cell = (old as? Cell) ?: Cell(this@LibraryActivity)
             val p = photos[i]
             cell.tag = p.uri
-            cell.contentDescription = "Photo from ${dates.format(Date(p.takenAt))}"
+            cell.mark = marks[p.key]
+            cell.contentDescription = "Photo from ${dates.format(Date(p.takenAt))}" + (cell.mark?.let { m ->
+                listOfNotNull(if (m.rating > 0) "${m.rating} stars" else null, if (m.flag > 0) "picked" else if (m.flag < 0) "rejected" else null, m.label)
+                    .joinToString(", ", ", ")
+            } ?: "")
+            cell.invalidate()
             val hit = thumbs.get(p.uri)
             cell.setImageBitmap(hit)
             if (hit == null) pool.execute {
