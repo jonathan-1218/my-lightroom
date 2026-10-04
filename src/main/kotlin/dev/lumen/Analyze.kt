@@ -25,14 +25,14 @@ fun autoTone(src: Bitmap): Map<String, Float> {
     val lo = pct(0.005f); val hi = pct(0.995f)
     val mean = l.average().toFloat().coerceAtLeast(0.02f) // mean, not median: a mostly-black frame shouldn't be dragged to grey
     // ponytail: one global target; a scene-aware target (night, snow) is the upgrade if Auto feels flat
-    val ev = (ln(0.42f.pow(2.2f) / mean.pow(2.2f)) / ln(2f)).coerceIn(-1.2f, 1.2f)
+    val ev = (0.6f * ln(0.42f.pow(2.2f) / mean.pow(2.2f)) / ln(2f)).coerceIn(-1.2f, 1.2f) // go 60% of the way: Auto is a starting point
     val gain = 2f.pow(ev / 2.2f)
     val clipped = l.count { it > 0.97f }.toFloat() / l.size
     val dark = l.count { it < 0.05f }.toFloat() / l.size
     return mapOf(
         "exposure" to ev / 2,
-        "whites" to ((1 - (hi * gain).coerceAtMost(1.2f) / 0.98f) / 0.15f).coerceIn(-1f, 1f),
-        "blacks" to (-((lo * gain) - 0.01f) / 0.15f).coerceIn(-1f, 1f),
+        "whites" to ((1 - (hi * gain).coerceAtMost(1.2f) / 0.98f) / 0.15f).coerceIn(-0.5f, 0.5f),
+        "blacks" to (-((lo * gain) - 0.01f) / 0.15f).coerceIn(-0.5f, 0.5f),
         "contrast" to (0.3f * (0.8f - (hi - lo))).coerceIn(-0.3f, 0.3f),
         "highlights" to if (clipped > 0.02f) -0.3f else 0f,
         "shadows" to if (dark > 0.1f) 0.3f else 0f,

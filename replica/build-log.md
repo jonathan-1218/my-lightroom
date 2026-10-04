@@ -34,3 +34,19 @@ Milestone 4 checked on the emulator: library filters (3★, album), long-press m
 Auto + histogram, profile chips, .cube import → applied, .xmp import → preset with exactly its 4 settings, keystone, grain, distortion.
 Release build (R8): 224 KB APK, self-test 27/27 PASS, library + editor open without crashes.
 Self-test only (not driven by hand): colour grading, noise reduction, auto level, find spots, perspective fit, versions DB, watermark.
+
+## Lumen for Mac (2026-10-04)
+
+`mac/`: SwiftUI + Core Image, no dependencies, 1.7 MB app. Build: `mac/build.sh` (`install` copies it to /Applications).
+- Same edit document, same `schema.sql` and `tokens.json` (copied into the bundle at build time), same develop maths:
+  the Android AGSL shader translated line for line into a Core Image kernel. The self-test prints the same pixel values as
+  Android (base 808080, bright afafaf, warm 90806d, red 4a4a4a): 29 checks, PASS.
+- Mac extras: RAW from 930 camera models (macOS decodes them), HEIC and TIFF export, folders instead of the phone gallery,
+  click / ⌘-click / ⇧-click selection, menus and keyboard shortcuts.
+- Checked by driving the app: library grid + edited badge, editor open, Auto, crop 1:1 + rotate, radial mask + invert + delete,
+  presets, export (HEIC 2048 + watermark), heal spot with auto source, Info tab.
+- Found while testing: deleting a mask crashed (a slider read the deleted mask on its way out), fixed with guarded bindings;
+  Auto clipped bright photos (whites/blacks ±100), now 60% of the way and capped at ±50 on both platforms; portrait thumbnails
+  broke the grid; the sidebar now hides while editing; the Masks tab opens on the first mask.
+- Not driven by hand: slider dragging (background automation can't move SwiftUI sliders), brush painting, curve dragging,
+  .cube/.xmp import, batch actions. The same code paths are covered by the self-test or by the Android build.
