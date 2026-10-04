@@ -35,12 +35,14 @@ The edit document (stored in `photos.edit`, `versions.edit`, `presets.edit`):
   "optics": { "distortion": 0, "ca": 0, "lensVignette": 0 },
   "geometry": { "crop": [0,0,1,1], "straighten": 0, "rot90": 0, "flipH": false },
   "profile": "color",
-  "masks":  [ { "type": "linear|radial|brush|color|luma", "shape": {}, "invert": false,
-                "feather": 0.5, "adjust": { "exposure": 0, "...": "same keys as light/color/effects" } } ],
-  "retouch":[ { "mode": "heal|clone", "dst": [x,y], "src": [x,y], "r": 0.02 } ] }
+  "masks":  [ { "type": "linear|radial|brush|color|luma", "g": [4 numbers, meaning by type], "invert": false,
+                "feather": 0.5, "range": 0.3, "strokes": [ { "size": 0.05, "erase": false, "p": [x,y, x,y, …] } ],
+                "adjust": { "exposure","contrast","highlights","shadows","temp","tint","saturation","clarity" } } ],
+  "retouch":[ [dx, dy, sx, sy, r, heal 1|0] ] }
 ```
 
 Coordinates and radii are normalised (0..1 of the image), so preview and export match at any resolution.
+Masks and spots use source coordinates, so they stay on the content when the crop changes. Up to 4 masks (shader slots).
 
 ## Screens and actions (replaces the API table; there is no server)
 

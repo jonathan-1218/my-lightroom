@@ -19,3 +19,12 @@ Milestone 2 checked on the emulator: presets (apply, undo), crop (straighten, 1:
 clarity/dehaze, rating/flag/label → library badges, full-size tiled export. Self-test: 12 checks, PASS.
 The library's empty state was seen for real after an emulator cold boot (`S01-empty.png`).
 Not exercised: DNG (no sample), preset delete dialog, flip, Ctrl/letter shortcuts on a hardware keyboard.
+| S04 Masks | 2026-10-04 | done | AI subject / sky (needs ML Kit), add/subtract/intersect of components, more than 4 masks | a local fun named `select` silently won over `Tabs.select` inside `.apply { }` and re-selected mask 1; Tabs now take `initial`, which also fixed export settings not being remembered |
+| S05 Retouch | 2026-10-04 | partial | freeform heal strokes, auto source search, content-aware remove | re-baking the spot + two GPU blurs on every move stalled the UI ~2 s per event on the emulator, so drags move the circles and apply on release |
+| S08 Export (milestone 3) | 2026-10-04 | done | TIFF, export original | — |
+
+Milestone 3 checked on the emulator: gradient (handles, overlay, darkened sky), radial (handles), brush (soft stroke), colour range (pick red → only reds darken),
+masks saved and restored, heal spot + clone with dragged source, export dialog (WebP 2048 → 2048×1638 with masks, crop and spot baked in), settings remembered,
+Share opens the system sheet. Self-test: 17 checks, PASS.
+Known slow spot: adding/moving a spot re-blurs the preview (~2 s on the emulator GPU); fine on a phone, worth caching if it isn't.
+Not exercised on device: luminance mask, mask invert (self-test only), brush erase.

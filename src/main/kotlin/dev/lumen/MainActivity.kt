@@ -23,6 +23,9 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.WindowInsets
 import android.widget.EditText
+import android.widget.HorizontalScrollView
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.LinearLayout.LayoutParams
@@ -80,18 +83,19 @@ class MainActivity : Activity() {
             undoBtn = textButton("Undo") { step(undo, redo) }.also { addView(it) }
             redoBtn = textButton("Redo") { step(redo, undo) }.also { addView(it) }
             addView(textButton("Reset") { checkpoint(); view.edit = Edit().also { it.crop = edit.crop; it.rot90 = edit.rot90; it.flipH = edit.flipH; it["straighten"] = edit["straighten"] }; refresh() })
-            addView(textButton("Export") { export() })
+            addView(textButton("Export") { exportDialog() })
         }
 
         val panels = linkedMapOf(
             "Presets" to presetsPanel(), "Crop" to cropPanel(), "Light" to sliders("light"), "Curve" to curvePanel(), "Color" to colorPanel(),
-            "Effects" to sliders("effects"), "Detail" to sliders("detail"), "Rate" to ratePanel())
+            "Effects" to sliders("effects"), "Detail" to sliders("detail"), "Masks" to masksPanel(), "Retouch" to retouchPanel(),
+            "Rate" to ratePanel())
         val host = FrameLayout(this).apply { panels.values.forEach { addView(it) } }
         val scroller = ScrollView(this).apply { addView(host) }
         val tabs = Tabs(this, panels.keys.toList()) { sel ->
             panels.values.forEachIndexed { j, p -> p.visibility = if (j == sel) View.VISIBLE else View.GONE }
             scroller.scrollTo(0, 0) // each panel opens at its top
-            view.cropMode = panels.keys.elementAt(sel) == "Crop"
+            view.mode = when (panels.keys.elementAt(sel)) { "Crop" -> "crop"; "Masks" -> "mask"; "Retouch" -> "retouch"; else -> "normal" }
         }
         tabs.select(2)
 
@@ -134,9 +138,17 @@ class MainActivity : Activity() {
     }
 
     /** A slider bound to an edit key (the key can change, e.g. the colour mixer's selected hue). */
-    private fun slider(title: String, key: () -> String, after: () -> Unit = {}) =
-        SliderRow(this, title, ::checkpoint) { p -> edit[key()] = p / 100f; after(); changed() }
-            .also { r -> sync += { r.bar.progress = Math.round(edit[key()] * 100) } }
+    /** A -100..100 slider bound to any value in the edit. `register` keeps it in step on load / undo / preset. */
+    private fun bound(title: String, get: () -> Float, set: (Float) -> Unit, register: Boolean = true, after: () -> Unit = {}) =
+        SliderRow(this, title, ::checkpoint) { p -> set(p / 100f); after(); changed() }
+            .also { r -> r.bar.progress = Math.round(get() * 100); if (register) sync += { r.bar.progress = Math.round(get() * 100) } }
+
+    private fun slider(title: String, key: () -> String, after: () -> Unit = {}) = bound(title, { edit[key()] }, { edit[key()] = it }, after = after)
+
+    /** A slider for a 0..1 value (shown -100..100). */
+    private fun unit(title: String, get: () -> Float, set: (Float) -> Unit) = bound(title, { get() * 2 - 1 }, { set((it + 1) / 2) }, register = false)
+
+    private fun hint(s: String) = Ui.type(TextView(this), "sm", "text-muted").apply { text = s; setPadding(Ui.space(4), Ui.space(2), Ui.space(4), 0) }
 
     private fun sliders(section: String) = column(*SECTIONS.getValue(section).map { k -> slider(k, { k }) }.toTypedArray())
 
@@ -196,12 +208,106 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    // ---- S04 masks ----
+
+    private var selMask = -1
+    private fun mask() = edit.masks.getOrNull(selMask)
+    private val maskNames = mapOf("linear" to "Gradient", "radial" to "Radial", "brush" to "Brush", "color" to "Color", "luma" to "Light")
+
+    private fun masksPanel(): View {
+        val chips = FrameLayout(this)
+        val typeBox = column()
+        val adjust = MASK_ADJ.mapIndexed { i, k -> bound(k, { mask()?.adj?.get(i) ?: 0f }, { v -> mask()?.adj?.set(i, v) }, register = false) }
+        val adjustBox = column(heading("Adjust this mask"), *adjust.toTypedArray())
+        lateinit var rebuild: () -> Unit
+        fun pick(i: Int) { // not "select": a local select() wins over Tabs.select() inside .apply { }
+            selMask = i; view.mask = i
+            adjust.forEachIndexed { j, r -> r.bar.progress = Math.round((mask()?.adj?.get(j) ?: 0f) * 100) }
+            adjustBox.visibility = if (mask() == null) View.GONE else View.VISIBLE
+            typeBox.removeAllViews()
+            val m = mask() ?: return typeBox.addView(hint("Add a mask to adjust part of the photo. Up to $MAX_MASKS."))
+            when (m.type) {
+                "linear" -> typeBox.addView(hint("Full effect at the solid dot, fading out by the ring. Drag the middle to move both."))
+                "radial" -> { typeBox.addView(hint("Drag the centre to move, the rings to resize.")); typeBox.addView(unit("Feather", { m.feather }, { m.feather = it })) }
+                "brush" -> {
+                    typeBox.addView(Tabs(this, listOf("Paint", "Erase"), initial = if (view.erase) 1 else 0) { view.erase = it == 1 })
+                    typeBox.addView(SliderRow(this, "Size", {}) { p -> view.brushSize = 0.01f + (p + 100) / 200f * 0.19f }.apply { bar.progress = Math.round(((view.brushSize - 0.01f) / 0.19f) * 200 - 100) })
+                    typeBox.addView(unit("Softness", { m.feather }, { m.feather = it }))
+                }
+                "color" -> { typeBox.addView(hint("Tap the photo on the colour to select.")); typeBox.addView(unit("Range", { (m.range - 0.05f) / 0.55f }, { m.range = 0.05f + it * 0.55f })) }
+                "luma" -> {
+                    typeBox.addView(unit("Darkest", { m.g[0] }, { m.g[0] = it }))
+                    typeBox.addView(unit("Brightest", { m.g[1] }, { m.g[1] = it }))
+                    typeBox.addView(unit("Feather", { m.feather }, { m.feather = it }))
+                }
+            }
+            view.invalidate()
+        }
+        rebuild = {
+            selMask = selMask.coerceAtMost(edit.masks.size - 1).let { if (it < 0 && edit.masks.isNotEmpty()) 0 else it }
+            chips.removeAllViews()
+            if (edit.masks.isNotEmpty()) chips.addView(Tabs(this, edit.masks.mapIndexed { i, m -> "${i + 1} ${maskNames[m.type]}" }, initial = selMask) { pick(it) })
+            else pick(-1)
+        }
+        fun add(type: String) {
+            val l = view.look ?: return
+            if (edit.masks.size >= MAX_MASKS) return toast("Up to $MAX_MASKS masks")
+            checkpoint()
+            val aspect = l.src.width.toFloat() / l.src.height
+            edit.masks = edit.masks + Mask(type).apply {
+                when (type) {
+                    "linear" -> g = floatArrayOf(0.5f, 0.15f, 0.5f, 0.5f)                   // the sky, usually
+                    "radial" -> g = floatArrayOf(0.5f, 0.5f, 0.25f, 0.25f * aspect)        // a circle on screen
+                    "luma" -> g = floatArrayOf(0.6f, 1f, 0f, 0f)                           // the highlights
+                }
+            }
+            selMask = edit.masks.size - 1
+            rebuild(); changed()
+        }
+        sync += { rebuild() }
+        val adds = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(buttons(*MASK_TYPES.map { t -> textButton("+ ${maskNames[t]}") { add(t) } }.toTypedArray()))
+        }
+        val actions = buttons(
+            textButton("Invert") { mask()?.let { checkpoint(); it.invert = !it.invert; changed() } },
+            textButton("Hide overlay") {}.apply {
+                setOnClickListener { view.overlay = !view.overlay; text = if (view.overlay) "Hide overlay" else "Show overlay"; view.invalidate() }
+            },
+            textButton("Delete") { mask()?.let { checkpoint(); edit.masks = edit.masks - it; rebuild(); changed() } })
+        rebuild()
+        return column(adds, chips, actions, typeBox, adjustBox)
+    }
+
+    // ---- S05 heal / clone ----
+
+    private fun retouchPanel(): View {
+        lateinit var delete: View
+        view.onSpot = { delete.isEnabled = view.spot >= 0 }
+        val mode = Tabs(this, listOf("Heal", "Clone"), initial = if (view.heal) 0 else 1) { i ->
+            view.heal = i == 0
+            edit.retouch.getOrNull(view.spot)?.takeIf { it.heal != view.heal }?.let { s ->
+                checkpoint(); edit.retouch = edit.retouch.toMutableList().also { it[view.spot] = s.copy(heal = view.heal) }; changed()
+            }
+        }
+        val size = SliderRow(this, "Size", { if (view.spot >= 0) checkpoint() }) { p ->
+            view.spotSize = 0.005f + (p + 100) / 200f * 0.095f
+            edit.retouch.getOrNull(view.spot)?.let { s -> edit.retouch = edit.retouch.toMutableList().also { it[view.spot] = s.copy(r = view.spotSize) }; changed() }
+        }.apply { bar.progress = Math.round((view.spotSize - 0.005f) / 0.095f * 200 - 100) }
+        delete = textButton("Delete spot") {
+            edit.retouch.getOrNull(view.spot)?.let { s -> checkpoint(); edit.retouch = edit.retouch - s; view.spot = -1; view.onSpot(); changed() }
+        }.apply { isEnabled = false }
+        val clear = textButton("Clear all") { if (edit.retouch.isNotEmpty()) { checkpoint(); edit.retouch = emptyList(); view.spot = -1; view.onSpot(); changed() } }
+        sync += { if (view.spot >= edit.retouch.size) { view.spot = -1; view.onSpot() } }
+        return column(hint("Tap a spot to fix it. Drag the dashed circle to choose what it copies from."), mode, size, buttons(delete, clear))
+    }
+
     private fun presetsPanel(): View {
         val list = column()
         fun build() {
             list.removeAllViews()
             db.presets().forEach { p ->
-                list.addView(textButton(p.name) { checkpoint(); edit.merge(p.edit, geometry = false); refresh() }.apply {
+                list.addView(textButton(p.name) { checkpoint(); edit.merge(p.edit, whole = false); refresh() }.apply {
                     gravity = Gravity.CENTER_VERTICAL or Gravity.START
                     setPadding(Ui.space(4), 0, Ui.space(4), 0)
                     contentDescription = "Apply preset ${p.name}. Long press to delete."
@@ -217,11 +323,11 @@ class MainActivity : Activity() {
             val input = EditText(this).apply { setText("My look ${db.presets().size + 1}"); selectAll() }
             AlertDialog.Builder(this).setTitle("Preset name").setView(input)
                 .setPositiveButton("Save") { _, _ ->
-                    input.text.toString().trim().takeIf { it.isNotEmpty() }?.let { db.savePreset(it, edit.toJson(geometry = false)); build() }
+                    input.text.toString().trim().takeIf { it.isNotEmpty() }?.let { db.savePreset(it, edit.toJson(whole = false)); build() }
                 }.setNegativeButton("Cancel", null).show()
         }
-        val copy = textButton("Copy edits") { Clip.edit = edit.toJson(geometry = false); pasteBtn.isEnabled = true; toast("Edits copied") }
-        pasteBtn = textButton("Paste edits") { Clip.edit?.let { checkpoint(); edit.merge(it, geometry = false); refresh() } }
+        val copy = textButton("Copy edits") { Clip.edit = edit.toJson(whole = false); pasteBtn.isEnabled = true; toast("Edits copied") }
+        pasteBtn = textButton("Paste edits") { Clip.edit?.let { checkpoint(); edit.merge(it, whole = false); refresh() } }
             .apply { isEnabled = Clip.edit != null }
         build()
         return column(buttons(save, copy, pasteBtn), heading("Presets"), list)
@@ -316,22 +422,22 @@ class MainActivity : Activity() {
         finish()
     }
 
-    /** Decoded in sRGB (P3 photos convert once, up front), long edge at most `cap`. Returns the full size too. */
-    private fun decode(uri: Uri, cap: Int): Pair<Bitmap, Size> {
+    /** Decoded in sRGB (P3 photos convert once, up front), scaled by `scale(full size)` if below 1. Returns the full size too. */
+    private fun decode(uri: Uri, scale: (Size) -> Float): Pair<Bitmap, Size> {
         var size = Size(1, 1)
         val b = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { d, info, _ ->
             size = info.size
             d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             d.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.SRGB))
-            val k = cap.toFloat() / maxOf(info.size.width, info.size.height)
-            if (k < 1) d.setTargetSize((info.size.width * k).toInt(), (info.size.height * k).toInt())
+            val k = scale(info.size)
+            if (k < 1) d.setTargetSize((info.size.width * k).toInt().coerceAtLeast(1), (info.size.height * k).toInt().coerceAtLeast(1))
         }
         return b to size
     }
 
     private fun load(uri: Uri) = Thread {
         val result = runCatching {
-            val (bmp, size) = decode(uri, 2048) // preview: the shader runs per screen pixel, 2048 is plenty
+            val (bmp, size) = decode(uri) { 2048f / maxOf(it.width, it.height) } // preview: the shader runs per screen pixel, 2048 is plenty
             Look(bmp) to db.open(keyOf(uri), uri, size.width, size.height)
         }.onFailure { Log.w("Lumen", "open $uri", it) }.getOrNull()
         runOnUiThread {
@@ -350,27 +456,83 @@ class MainActivity : Activity() {
     private fun keyOf(uri: Uri): String = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
         ?.use { if (it.moveToFirst()) key(it.getString(0), it.getLong(1), uri) else null } ?: uri.toString()
 
-    private fun export() {
-        val uri = source ?: return toast("Open a photo first")
+    private class ExportOptions(val format: String, val long: Int, val quality: Int, val meta: Boolean)
+
+    /** S08: format, size, quality, metadata; Export saves to Pictures/Lumen, Share also hands it to another app. */
+    private fun exportDialog() {
+        if (source == null) return toast("Open a photo first")
+        val prefs = getSharedPreferences("export", MODE_PRIVATE) // remembered between exports
+        val formats = listOf("JPEG", "PNG", "WebP")
+        val sizes = listOf(0 to "Full size", 4096 to "4096 px", 2048 to "2048 px", 1080 to "1080 px")
+        var format = prefs.getString("format", "JPEG")!!; var long = prefs.getInt("long", 0)
+        var quality = prefs.getInt("quality", 92); var meta = prefs.getBoolean("meta", true)
+        val qLabel = Ui.type(TextView(this), "sm").apply { setPadding(Ui.space(4), 0, Ui.space(4), 0) }
+        val q = SeekBar(this).apply {
+            min = 50; max = 100; progress = quality
+            thumbTintList = android.content.res.ColorStateList.valueOf(Ui.color("accent"))
+            progressTintList = thumbTintList
+            contentDescription = "Quality"
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar, p: Int, u: Boolean) { quality = p; qLabel.text = "Quality  $p"; stateDescription = "$p" }
+                override fun onStartTrackingTouch(s: SeekBar) {}
+                override fun onStopTrackingTouch(s: SeekBar) {}
+            })
+        }
+        qLabel.text = "Quality  $quality"
+        val metaSwitch = Switch(this).apply {
+            text = "Keep date, camera and lens info"; isChecked = meta; setOnCheckedChangeListener { _, c -> meta = c }
+            Ui.type(this, "sm"); setPadding(Ui.space(4), Ui.space(2), Ui.space(4), 0); minHeight = Ui.size("touch")
+            val on = intArrayOf(android.R.attr.state_checked)
+            thumbTintList = android.content.res.ColorStateList(arrayOf(on, intArrayOf()), intArrayOf(Ui.color("accent"), Ui.color("text-muted")))
+            trackTintList = android.content.res.ColorStateList(arrayOf(on, intArrayOf()), intArrayOf(Ui.color("accent"), Ui.color("border")))
+        }
+        val body = column(
+            heading("Format"), Tabs(this, formats, initial = formats.indexOf(format)) { format = formats[it]; q.isEnabled = format != "PNG" },
+            heading("Long edge"), Tabs(this, sizes.map { it.second }, initial = sizes.indexOfFirst { it.first == long }) { long = sizes[it].first },
+            qLabel.apply { setPadding(Ui.space(4), Ui.space(4), Ui.space(4), 0) }, q, metaSwitch).apply { setBackgroundColor(Ui.color("surface")) }
+        fun go(share: Boolean) {
+            prefs.edit().putString("format", format).putInt("long", long).putInt("quality", quality).putBoolean("meta", meta).apply()
+            export(ExportOptions(format, long, quality, meta), share)
+        }
+        AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(body) })
+            .setPositiveButton("Export") { _, _ -> go(false) }
+            .setNeutralButton("Share") { _, _ -> go(true) }
+            .setNegativeButton("Cancel", null).show()
+            .apply { listOf(-1, -2, -3).forEach { getButton(it)?.setTextColor(Ui.color("accent")) } } // positive, negative, neutral
+    }
+
+    private fun export(o: ExportOptions, share: Boolean) {
+        val uri = source ?: return
         val e = edit.copy()
         toast("Exporting…")
         Thread {
-            // ponytail: full size first, 4096 px if memory runs out (8 bytes/px: decode + output)
-            val out = listOf(Int.MAX_VALUE, 4096).firstNotNullOfOrNull { cap ->
-                runCatching { Look(decode(uri, cap).first).render(e) }.onFailure { Log.w("Lumen", "export at $cap", it) }.getOrNull()
+            // ponytail: requested size first, 4096 px if memory runs out (8 bytes/px: decode + output)
+            val out = listOf(o.long.takeIf { it > 0 } ?: Int.MAX_VALUE, 4096).distinct().firstNotNullOfOrNull { target ->
+                runCatching {
+                    Look(decode(uri) { s -> e.outSize(s.width, s.height).let { (w, h) -> target.toFloat() / maxOf(w, h) } }.first).render(e)
+                }.onFailure { Log.w("Lumen", "export at $target", it) }.getOrNull()
+            }
+            val (mime, ext, fmt) = when (o.format) {
+                "PNG" -> Triple("image/png", "png", Bitmap.CompressFormat.PNG)
+                "WebP" -> Triple("image/webp", "webp", Bitmap.CompressFormat.WEBP_LOSSY)
+                else -> Triple("image/jpeg", "jpg", Bitmap.CompressFormat.JPEG)
             }
             val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "Lumen_${System.currentTimeMillis()}.jpg")
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.DISPLAY_NAME, "Lumen_${System.currentTimeMillis()}.$ext")
+                put(MediaStore.Images.Media.MIME_TYPE, mime)
                 put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Lumen")
                 put(MediaStore.Images.Media.IS_PENDING, 1) // hidden from other apps until EXIF is written
             }
             val dest = if (out != null) contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) else null
-            val ok = out != null && dest != null && contentResolver.openOutputStream(dest)
-                ?.use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) } == true &&
-                runCatching { copyExif(uri, dest) }.onFailure { Log.w("Lumen", "exif", it) }.isSuccess
+            val ok = out != null && dest != null && contentResolver.openOutputStream(dest)?.use { out.compress(fmt, o.quality, it) } == true
+            if (ok && o.meta) runCatching { copyExif(uri, dest!!) }.onFailure { Log.w("Lumen", "exif", it) } // metadata is best effort
             if (dest != null) contentResolver.update(dest, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
-            runOnUiThread { toast(if (ok) "Exported ${out!!.width}×${out.height} to Pictures/Lumen" else "Export failed") }
+            runOnUiThread {
+                if (!ok) return@runOnUiThread toast("Export failed")
+                toast("Exported ${out!!.width}×${out.height} ${o.format} to Pictures/Lumen")
+                if (share) startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType(mime)
+                    .putExtra(Intent.EXTRA_STREAM, dest).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "Share photo"))
+            }
         }.start()
     }
 
@@ -426,11 +588,31 @@ class MainActivity : Activity() {
             listOf(16, 8, 0).all { s -> abs((pa[i] shr s and 0xFF) - (pb[i] shr s and 0xFF)) <= 2 }
         }
 
-        val m = Edit().apply { this["exposure"] = 0.4f }.merge("""{"color":{"temp":0.3}}""", geometry = false)
+        val m = Edit().apply { this["exposure"] = 0.4f }.merge("""{"color":{"temp":0.3}}""", whole = false)
         checks["preset merge"] = m["exposure"] == 0.4f && abs(m["temp"] - 0.3f) < 1e-6f
-        val j = Edit().apply { this["clarity"] = 0.2f; curves = listOf(listOf(0f to 0.1f, 1f to 0.9f), LINE, LINE, LINE); rotateRight() }
+        // masks: a radial mask lifts its centre and leaves the corner; a gradient is full at a, none at b; an unpicked colour mask does nothing
+        val flat = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.rgb(100, 100, 100)) }
+        fun masked(m: Mask) = Look(flat).render(Edit().apply { masks = listOf(m) })
+        val radial = masked(Mask("radial").apply { this.g = floatArrayOf(0.5f, 0.5f, 0.25f, 0.25f); adj[0] = 1f })
+        checks["radial mask"] = Color.red(radial.getPixel(32, 32)) > 140 && Color.red(radial.getPixel(2, 2)) in 98..102
+        val linear = masked(Mask("linear").apply { this.g = floatArrayOf(0.5f, 0f, 0.5f, 0.5f); adj[0] = 1f })
+        checks["gradient mask"] = Color.red(linear.getPixel(32, 1)) > 140 && Color.red(linear.getPixel(32, 60)) in 98..102
+        checks["unpicked colour mask"] = Color.red(masked(Mask("color").apply { adj[0] = 1f }).getPixel(32, 32)) in 98..102
+        val inverted = masked(Mask("radial").apply { this.g = floatArrayOf(0.5f, 0.5f, 0.25f, 0.25f); adj[0] = 1f; invert = true })
+        checks["inverted mask"] = Color.red(inverted.getPixel(32, 32)) in 98..102 && Color.red(inverted.getPixel(2, 2)) > 140
+        // heal: a dark dot on grey is gone after one spot
+        val dotted = flat.copy(Bitmap.Config.ARGB_8888, true).apply { for (x in 30..34) for (y in 30..34) setPixel(x, y, Color.BLACK) }
+        val healed = bake(dotted, listOf(Spot(0.5f, 0.5f, 0.2f, 0.2f, 0.08f, heal = true)))
+        checks["heal"] = Color.red(healed.getPixel(32, 32)) in 95..105 && Color.red(dotted.getPixel(32, 32)) == 0
+
+        val j = Edit().apply {
+            this["clarity"] = 0.2f; curves = listOf(listOf(0f to 0.1f, 1f to 0.9f), LINE, LINE, LINE); rotateRight()
+            masks = listOf(Mask("brush").apply { adj[2] = -0.5f; strokes = listOf(Stroke(floatArrayOf(0.1f, 0.1f, 0.3f, 0.4f), 0.05f, false)) })
+            retouch = listOf(Spot(0.5f, 0.5f, 0.6f, 0.5f, 0.02f, heal = false))
+        }
         val back = Edit().merge(j.toJson())
-        checks["json round trip"] = back.toJson() == j.toJson()
+        checks["json round trip"] = back.toJson() == j.toJson() && back.masks.size == 1 && back.retouch.size == 1 &&
+            Edit().merge(j.toJson(whole = false)).masks.isEmpty() // presets and paste never carry masks
 
         val d = Db(this, null)
         val first = d.open("a.jpg|1", Uri.EMPTY, 1, 1)

@@ -1,6 +1,9 @@
 package dev.lumen
 
 import android.graphics.Bitmap
+import android.graphics.BlurMaskFilter
+import android.graphics.Color
+import android.graphics.Path
 import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.ColorSpace
@@ -18,6 +21,7 @@ import android.hardware.HardwareBuffer
 import android.media.ImageReader
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 // The edit document (replica/architecture.md). Every slider value is -1..1, 0 = untouched.
@@ -36,35 +40,88 @@ private val SCALARS = SECTIONS.filterKeys { it != "mixer" && it != "geometry" }.
 val CHANNELS = listOf("rgb", "r", "g", "b")
 val LINE = listOf(0f to 0f, 1f to 1f)
 
+// ---- masks: local adjustments. Coordinates are 0..1 of the source photo, so they stick to the content. ----
+const val MAX_MASKS = 4 // ponytail: 4 shader slots; raise with the slot count if 4 is ever too few
+val MASK_TYPES = listOf("linear", "radial", "brush", "color", "luma")
+val MASK_ADJ = listOf("exposure", "contrast", "highlights", "shadows", "temp", "tint", "saturation", "clarity")
+
+class Stroke(val pts: FloatArray, val size: Float, val erase: Boolean) // pts x,y pairs; size = fraction of the long edge
+
+/** g by type: linear (ax, ay, bx, by) full effect at a, none at b · radial (cx, cy, rx, ry) · color (r, g, b, picked>0) · luma (low, high). */
+class Mask(val type: String) {
+    var g = FloatArray(4)
+    var feather = 0.5f // radial edge, luma edge, brush softness
+    var invert = false
+    var range = 0.3f   // colour distance that still counts
+    val adj = FloatArray(MASK_ADJ.size)
+    var strokes: List<Stroke> = emptyList()
+
+    fun copy() = Mask(type).also { m ->
+        m.g = g.copyOf(); m.feather = feather; m.invert = invert; m.range = range; adj.copyInto(m.adj); m.strokes = strokes
+    }
+
+    fun json(): JSONObject = JSONObject().put("type", type).put("g", JSONArray(g.map { it.toDouble() }))
+        .put("feather", feather.toDouble()).put("invert", invert).put("range", range.toDouble())
+        .put("adjust", JSONObject().apply { MASK_ADJ.forEachIndexed { i, k -> put(k, adj[i].toDouble()) } })
+        .put("strokes", JSONArray(strokes.map { s ->
+            JSONObject().put("size", s.size.toDouble()).put("erase", s.erase).put("p", JSONArray(s.pts.map { it.toDouble() }))
+        }))
+
+    companion object {
+        fun from(o: JSONObject) = Mask(o.getString("type")).apply {
+            o.optJSONArray("g")?.let { a -> g = FloatArray(4) { a.optDouble(it, 0.0).toFloat() } }
+            feather = o.optDouble("feather", 0.5).toFloat(); invert = o.optBoolean("invert"); range = o.optDouble("range", 0.3).toFloat()
+            o.optJSONObject("adjust")?.let { a -> MASK_ADJ.forEachIndexed { i, k -> adj[i] = a.optDouble(k, 0.0).toFloat() } }
+            strokes = o.optJSONArray("strokes")?.let { arr ->
+                (0 until arr.length()).map { arr.getJSONObject(it) }.map { s ->
+                    val pa = s.getJSONArray("p")
+                    Stroke(FloatArray(pa.length()) { pa.getDouble(it).toFloat() }, s.getDouble("size").toFloat(), s.optBoolean("erase"))
+                }
+            } ?: emptyList()
+        }
+    }
+}
+
+/** Heal / clone spot: copy a circle from (sx, sy) onto (dx, dy). Coordinates 0..1 of the source, r of its long edge. */
+data class Spot(val dx: Float, val dy: Float, val sx: Float, val sy: Float, val r: Float, val heal: Boolean)
+
 class Edit {
     val v = FloatArray(SLIDERS.size)
     var curves: List<List<Pair<Float, Float>>> = List(4) { LINE } // rgb, r, g, b
     var crop = RectF(0f, 0f, 1f, 1f) // normalised to the rotated (oriented) image
     var rot90 = 0
     var flipH = false
+    var masks: List<Mask> = emptyList()
+    var retouch: List<Spot> = emptyList()
 
     operator fun get(n: String) = v[IDX.getValue(n)]
     operator fun set(n: String, x: Float) { v[IDX.getValue(n)] = x }
 
     fun copy() = Edit().also { e ->
         v.copyInto(e.v); e.curves = curves; e.crop = RectF(crop); e.rot90 = rot90; e.flipH = flipH
+        e.masks = masks.map { it.copy() }; e.retouch = retouch
     }
 
-    fun toJson(geometry: Boolean = true): String = JSONObject().put("v", 1).apply {
+    /** `whole = false`: just the look (presets, copy/paste) — no crop, masks or spots, which belong to one photo. */
+    fun toJson(whole: Boolean = true): String = JSONObject().put("v", 1).apply {
         SECTIONS.forEach { (s, names) ->
             if (s != "geometry") put(s, JSONObject().apply { names.forEach { put(it, this@Edit[it].toDouble()) } })
         }
         put("curve", JSONObject().apply {
             CHANNELS.forEachIndexed { i, ch -> put(ch, JSONArray(curves[i].map { (x, y) -> JSONArray(listOf(x.toDouble(), y.toDouble())) })) }
         })
-        if (geometry) put("geometry", JSONObject()
-            .put("straighten", this@Edit["straighten"].toDouble())
-            .put("crop", JSONArray(listOf(crop.left, crop.top, crop.right, crop.bottom).map { it.toDouble() }))
-            .put("rot90", rot90).put("flipH", flipH))
+        if (whole) {
+            put("geometry", JSONObject()
+                .put("straighten", this@Edit["straighten"].toDouble())
+                .put("crop", JSONArray(listOf(crop.left, crop.top, crop.right, crop.bottom).map { it.toDouble() }))
+                .put("rot90", rot90).put("flipH", flipH))
+            put("masks", JSONArray(masks.map { it.json() }))
+            put("retouch", JSONArray(retouch.map { JSONArray(listOf(it.dx, it.dy, it.sx, it.sy, it.r, if (it.heal) 1f else 0f).map { v -> v.toDouble() }) }))
+        }
     }.toString()
 
-    /** Overlay whatever keys `json` has (a preset sets only what it names). Geometry only when asked. */
-    fun merge(json: String, geometry: Boolean = true): Edit = apply {
+    /** Overlay whatever keys `json` has (a preset sets only what it names). Crop, masks and spots only when `whole`. */
+    fun merge(json: String, whole: Boolean = true): Edit = apply {
         val o = JSONObject(json)
         SECTIONS.forEach { (s, names) ->
             if (s == "geometry") return@forEach
@@ -78,7 +135,13 @@ class Edit {
             }
         }
         val g = o.optJSONObject("geometry")
-        if (geometry && g != null) {
+        if (whole) o.optJSONArray("masks")?.let { a -> masks = (0 until a.length()).map { Mask.from(a.getJSONObject(it)) }.take(MAX_MASKS) }
+        if (whole) o.optJSONArray("retouch")?.let { a ->
+            retouch = (0 until a.length()).map { a.getJSONArray(it) }.map { s ->
+                Spot(s.getDouble(0).toFloat(), s.getDouble(1).toFloat(), s.getDouble(2).toFloat(), s.getDouble(3).toFloat(), s.getDouble(4).toFloat(), s.getDouble(5) > 0.5)
+            }
+        }
+        if (whole && g != null) {
             if (g.has("straighten")) set("straighten", g.getDouble("straighten").toFloat())
             g.optJSONArray("crop")?.let { crop = RectF(it.getDouble(0).toFloat(), it.getDouble(1).toFloat(), it.getDouble(2).toFloat(), it.getDouble(3).toFloat()) }
             rot90 = g.optInt("rot90", rot90)
@@ -193,6 +256,10 @@ ${SCALARS.joinToString("\n") { "uniform float u_$it;" }}
 uniform float4 hueA; uniform float4 hueB;
 uniform float4 satA; uniform float4 satB;
 uniform float4 lumA; uniform float4 lumB;
+uniform float2 srcSize;
+uniform float showMask;
+uniform float3 overlayRgb;
+${(0 until MAX_MASKS).joinToString("\n") { "uniform shader mk$it; uniform float4 mg$it; uniform float4 mx$it; uniform float4 ma$it; uniform float4 mb$it;" }}
 const float3 W = float3(0.2126, 0.7152, 0.0722);
 
 float3 hsv(float3 c) {
@@ -214,6 +281,41 @@ float band(float4 a, float4 b, float h) {
          + a.w * tri(h, 60.0, 120.0, 180.0) + b.x * tri(h, 120.0, 180.0, 240.0) + b.y * tri(h, 180.0, 240.0, 270.0)
          + b.z * tri(h, 240.0, 270.0, 300.0) + b.w * tri(h, 270.0, 300.0, 360.0);
 }
+// Mask weights, 1 = full effect. u is 0..1 of the source photo.
+float linearW(float4 g, float2 u) {
+    float2 d = g.zw - g.xy;
+    return 1.0 - smoothstep(0.0, 1.0, dot(u - g.xy, d) / max(dot(d, d), 1e-6));
+}
+float radialW(float4 g, float f, float2 u) {
+    float d = length((u - g.xy) / max(g.zw, float2(1e-4)));
+    return 1.0 - smoothstep(1.0 - max(f, 0.01), 1.0, d);
+}
+float colorW(float4 g, float range, float3 oh) {
+    if (g.w <= 0.0) return 0.0; // no colour picked yet
+    float3 t = hsv(g.rgb);
+    float dh = abs(oh.x - t.x);
+    dh = min(dh, 1.0 - dh) * 2.0;
+    float dist = length(float2(dh, 0.5 * (oh.y - t.y))) + (1.0 - smoothstep(0.03, 0.15, oh.y)); // greys have no hue
+    return 1.0 - smoothstep(range * 0.5, range, dist);
+}
+float lumaW(float4 g, float f, float L) {
+    float e = 0.02 + 0.2 * f;
+    return smoothstep(g.x - e, g.x, L) * (1.0 - smoothstep(g.y, g.y + e, L));
+}
+// a = exposure, contrast, highlights, shadows · b = temp, tint, saturation, clarity
+float3 local(float3 x, float4 a, float4 b, float w, float dL) {
+    if (w <= 0.0) return x;
+    x *= exp2(2.0 * a.x * w / 2.2);
+    x *= float3(1.0 + 0.3 * b.x * w, 1.0 - 0.3 * b.y * w, 1.0 - 0.3 * b.x * w);
+    float L = dot(x, W);
+    float d = 0.3 * a.w * w * (1.0 - smoothstep(0.0, 0.6, L)) + 0.3 * a.z * w * smoothstep(0.4, 1.0, L);
+    x *= (L + d) / max(L, 0.001);
+    x = (x - 0.5) * (1.0 + 0.6 * a.y * w) + 0.5;
+    x += 1.2 * b.w * w * dL;
+    L = dot(x, W);
+    return mix(float3(L), x, 1.0 + b.z * w);
+}
+
 float3 curve(float3 x) {
     x = clamp(x, 0.0, 1.0) * 255.0 + 0.5;
     return float3(lut.eval(float2(x.r, 0.5)).r, lut.eval(float2(x.g, 0.5)).g, lut.eval(float2(x.b, 0.5)).b);
@@ -250,6 +352,19 @@ half4 main(float2 p) {
     float mid = 1.0 - (2.0 * L - 1.0) * (2.0 * L - 1.0);
     x += 1.5 * u_texture * dS + 1.2 * u_clarity * dL * mid;
     x = (x - 0.5) * (1.0 + 0.6 * u_contrast) + 0.5;
+
+    float2 u = p / srcSize;
+    float3 oh = hsv(float3(c.rgb)); // masks select on the original pixel, not the edited one
+    float oL = dot(float3(c.rgb), W);
+${(0 until MAX_MASKS).joinToString("\n") { i -> """
+    float w$i = 0.0;
+    if (mx$i.x == 1.0) w$i = linearW(mg$i, u);
+    else if (mx$i.x == 2.0) w$i = radialW(mg$i, mx$i.y, u);
+    else if (mx$i.x == 3.0) w$i = float(mk$i.eval(p).r);
+    else if (mx$i.x == 4.0) w$i = colorW(mg$i, mx$i.w, oh);
+    else if (mx$i.x == 5.0) w$i = lumaW(mg$i, mx$i.y, oL);
+    if (mx$i.x > 0.0 && mx$i.z > 0.5) w$i = 1.0 - w$i;
+    x = local(x, ma$i, mb$i, w$i, dL);""" }}
     x = curve(x);
 
     L = dot(x, W);
@@ -266,6 +381,10 @@ half4 main(float2 p) {
 
     float2 q = (toOut * float3(p, 1.0)).xy; // 0..1 across the cropped output
     x *= 1.0 + 0.8 * u_vignette * smoothstep(0.4, 1.1, length(q - 0.5) * 1.414);
+    if (showMask >= 0.0) {
+        float ws = showMask == 0.0 ? w0 : (showMask == 1.0 ? w1 : (showMask == 2.0 ? w2 : w3));
+        x = mix(x, overlayRgb, 0.5 * ws);
+    }
     return half4(half3(clamp(x, 0.0, 1.0)), c.a);
 }
 """
@@ -298,29 +417,112 @@ private fun blur(src: Bitmap, frac: Float, maxLong: Int): Bitmap {
     }
 }
 
-/** A photo ready to develop: the pixels, its blurs, and the shader. Build one per photo (and per export). */
-class Look(val src: Bitmap) {
-    private val blurS = blur(src, 0.004f, 1024)
-    private val blurL = blur(src, 0.03f, 512)
+/** Heal / clone spots copied into a new bitmap, before any develop step (so blurs and masks see the clean photo). */
+fun bake(base: Bitmap, spots: List<Spot>): Bitmap {
+    if (spots.isEmpty()) return base
+    val out = base.copy(Bitmap.Config.ARGB_8888, true)
+    val w = out.width; val h = out.height
+    for (s in spots) {
+        val r = (s.r * maxOf(w, h)).roundToInt().coerceAtLeast(1)
+        val size = 2 * r + 1
+        val dx = (s.dx * w).roundToInt() - r; val dy = (s.dy * h).roundToInt() - r
+        val sx = (s.sx * w).roundToInt() - r; val sy = (s.sy * h).roundToInt() - r
+        if (dx < 0 || dy < 0 || sx < 0 || sy < 0 || dx + size > w || dy + size > h || sx + size > w || sy + size > h) continue
+        val dst = IntArray(size * size).also { out.getPixels(it, 0, size, dx, dy, size, size) }
+        val src = IntArray(size * size).also { out.getPixels(it, 0, size, sx, sy, size, size) }
+        // Heal: shift the copied patch by the difference of the two rims, so it takes on the colour around the blemish.
+        val shift = FloatArray(3)
+        if (s.heal) {
+            var n = 0
+            for (i in dst.indices) {
+                val d = hypot((i % size - r).toFloat(), (i / size - r).toFloat()) / r
+                if (d in 0.8f..1f) { n++; for (k in 0..2) shift[k] += ((dst[i] shr (16 - 8 * k)) and 0xFF) - ((src[i] shr (16 - 8 * k)) and 0xFF).toFloat() }
+            }
+            if (n > 0) for (k in 0..2) shift[k] /= n
+        }
+        for (i in dst.indices) {
+            val d = hypot((i % size - r).toFloat(), (i / size - r).toFloat()) / r
+            if (d > 1f) continue
+            val a = 1f - ((d - 0.6f) / 0.4f).coerceIn(0f, 1f).let { it * it * (3 - 2 * it) } // feathered edge
+            var px = 0xFF shl 24
+            for (k in 0..2) {
+                val sh = 16 - 8 * k
+                val from = ((src[i] shr sh) and 0xFF) + shift[k]
+                val to = (dst[i] shr sh) and 0xFF
+                px = px or ((to + (from - to) * a).roundToInt().coerceIn(0, 255) shl sh)
+            }
+            dst[i] = px
+        }
+        out.setPixels(dst, 0, size, dx, dy, size, size)
+    }
+    return out
+}
+
+/** A brush mask rasterised from its strokes, white = painted. Long edge at most 1024. */
+private fun brush(m: Mask, w: Int, h: Int): Bitmap {
+    val k = minOf(1f, 1024f / maxOf(w, h))
+    val bw = (w * k).roundToInt().coerceAtLeast(1); val bh = (h * k).roundToInt().coerceAtLeast(1)
+    val b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+    val c = Canvas(b).apply { drawColor(Color.BLACK) }
+    val long = maxOf(bw, bh)
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+    for (s in m.strokes) {
+        paint.color = if (s.erase) Color.BLACK else Color.WHITE
+        paint.strokeWidth = s.size * long
+        paint.maskFilter = if (m.feather > 0.05f) BlurMaskFilter(s.size * long * m.feather * 0.5f, BlurMaskFilter.Blur.NORMAL) else null
+        if (s.pts.size == 2) c.drawPoint(s.pts[0] * bw, s.pts[1] * bh, paint)
+        else c.drawPath(Path().apply {
+            moveTo(s.pts[0] * bw, s.pts[1] * bh)
+            for (i in 2 until s.pts.size step 2) lineTo(s.pts[i] * bw, s.pts[i + 1] * bh)
+        }, paint)
+    }
+    return b
+}
+
+/** A photo ready to develop: the pixels (with spots baked in), its blurs, and the shader. One per photo, and per export. */
+class Look(val base: Bitmap) {
+    var src = base; private set
+    private var blurS = blur(src, 0.004f, 1024)
+    private var blurL = blur(src, 0.03f, 512)
+    private var spotsFor: List<Spot> = emptyList()
     private val fx = RuntimeShader(AGSL)
     private val paint = Paint().apply { shader = fx }
     private var lutFor: Any? = null
     private lateinit var lutShader: BitmapShader
+    private val brushFor = arrayOfNulls<Any>(MAX_MASKS)
+    private val brushShader = arrayOfNulls<BitmapShader>(MAX_MASKS)
+    private val none by lazy { shader(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.BLACK) }) }
+    var overlay = floatArrayOf(1f, 0.3f, 0.3f) // mask overlay colour, set from the tokens by the view
 
     private fun shader(b: Bitmap) = BitmapShader(b, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply {
         filterMode = BitmapShader.FILTER_MODE_LINEAR
-        if (b !== src) setLocalMatrix(Matrix().apply { setScale(src.width.toFloat() / b.width, src.height.toFloat() / b.height) })
+        if (b.width != src.width || b.height != src.height) setLocalMatrix(Matrix().apply { setScale(src.width.toFloat() / b.width, src.height.toFloat() / b.height) })
     }
 
-    /** Draws `e` in output pixels (or the uncropped straightened frame when `withCrop` is false). */
-    fun draw(c: Canvas, e: Edit, withCrop: Boolean = true) {
-        val w = src.width; val h = src.height
-        val (ow, oh) = if (withCrop) e.outSize(w, h) else e.oriented(w, h)
-        val m = e.matrix(w, h, withCrop)
+    private fun prepare(e: Edit) {
+        if (spotsFor != e.retouch) {
+            src = bake(base, e.retouch)
+            blurS = blur(src, 0.004f, 1024); blurL = blur(src, 0.03f, 512)
+            spotsFor = e.retouch
+        }
         if (lutFor != e.curves) { // the LUT is sampled in its own 256×1 pixel space, never scaled to the photo
             lutShader = BitmapShader(lut(e.curves), Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply { filterMode = BitmapShader.FILTER_MODE_LINEAR }
             lutFor = e.curves
         }
+        for (i in 0 until MAX_MASKS) {
+            val m = e.masks.getOrNull(i)?.takeIf { it.type == "brush" }
+            val key = m?.let { it.strokes to it.feather }
+            if (key != brushFor[i]) { brushShader[i] = m?.let { shader(brush(it, src.width, src.height)) }; brushFor[i] = key }
+        }
+    }
+
+    /** Draws `e` in output pixels (or the uncropped straightened frame when `withCrop` is false).
+     *  `showMask` tints that mask's area with the overlay colour (-1 = off). */
+    fun draw(c: Canvas, e: Edit, withCrop: Boolean = true, showMask: Int = -1) {
+        prepare(e)
+        val w = src.width; val h = src.height
+        val (ow, oh) = if (withCrop) e.outSize(w, h) else e.oriented(w, h)
+        val m = e.matrix(w, h, withCrop)
         fx.setInputShader("img", shader(src))
         fx.setInputShader("blurS", shader(blurS))
         fx.setInputShader("blurL", shader(blurL))
@@ -332,6 +534,18 @@ class Look(val src: Bitmap) {
             val x = HUES.map { e["$it$k"] }
             fx.setFloatUniform("${u}A", x[0], x[1], x[2], x[3])
             fx.setFloatUniform("${u}B", x[4], x[5], x[6], x[7])
+        }
+        fx.setFloatUniform("srcSize", w.toFloat(), h.toFloat())
+        fx.setFloatUniform("showMask", showMask.toFloat())
+        fx.setFloatUniform("overlayRgb", overlay[0], overlay[1], overlay[2])
+        for (i in 0 until MAX_MASKS) {
+            val mk = e.masks.getOrNull(i)
+            val a = mk?.adj ?: FloatArray(MASK_ADJ.size)
+            fx.setInputShader("mk$i", brushShader[i] ?: none)
+            fx.setFloatUniform("mg$i", mk?.g ?: FloatArray(4))
+            fx.setFloatUniform("mx$i", (mk?.let { MASK_TYPES.indexOf(it.type) + 1 } ?: 0).toFloat(), mk?.feather ?: 0f, if (mk?.invert == true) 1f else 0f, mk?.range ?: 0f)
+            fx.setFloatUniform("ma$i", a[0], a[1], a[2], a[3])
+            fx.setFloatUniform("mb$i", a[4], a[5], a[6], a[7])
         }
         c.save()
         c.clipRect(0f, 0f, ow.toFloat(), oh.toFloat())

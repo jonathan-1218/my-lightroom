@@ -43,3 +43,17 @@ Crop frame (EditView crop mode)
 Library cell marks
   parts     ★ × rating (text, shadow), ⚑ when picked, label dot (label-*), scrim over rejects
   a11y      contentDescription adds "4 stars, picked, blue"
+
+Mask handles (EditView mask mode)
+  linear    solid dot = full effect, ring = no effect, lines across the photo at both; drag the middle to move both
+  radial    ellipse outline, solid centre (move), two rings (x / y radius)
+  brush     finger paints strokes; Paint / Erase chips, Size, Softness
+  color     tap to pick; swatch of the picked colour top-left
+  overlay   selected mask's area tinted with `overlay` at 50%; "Hide overlay" / "Show overlay" toggles it
+
+Retouch spots (EditView retouch mode)
+  parts     solid ring = target (accent when selected), dashed ring + dashed line = source
+  gestures  tap empty photo = new spot, tap a ring = select, drag either ring; the photo updates on release
+
+Export dialog
+  parts     Format chips, Long edge chips, Quality slider (50–100, off for PNG), metadata switch (accent when on), Share / Cancel / Export in accent

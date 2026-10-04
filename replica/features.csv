@@ -26,25 +26,25 @@ Profiles (Color / Mono / creative LUTs),profiles,should,yes,no,.cube import as 3
 Presets: create apply import,presets,must,yes,partial,6 built-in + save/delete; no import of other apps' preset files
 Copy / paste edits,presets,must,yes,yes,copies everything except crop; lasts while the app process lives
 Batch apply to selected photos,presets,should,yes,no,
-Linear gradient mask,masking,should,yes,no,
-Radial gradient mask,masking,should,yes,no,
-Brush mask,masking,should,yes,no,
-Color range / luminance range mask,masking,should,yes,no,
-Mask feather and edge sliders,masking,should,yes,no,
+Linear gradient mask,masking,should,yes,yes,
+Radial gradient mask,masking,should,yes,yes,feather slider
+Brush mask,masking,should,yes,yes,paint / erase / size / softness; strokes stored as vectors
+Color range / luminance range mask,masking,should,yes,yes,tap to pick a colour + range; luminance low/high/feather (luminance not exercised on device)
+Mask feather and edge sliders,masking,should,yes,partial,feather on radial / brush / luminance; no separate edge slider
 Select subject / sky / background (AI),masking,could,yes,no,needs ML Kit segmentation = a dependency; breaks 'light'
-Heal and clone brush,retouch,should,yes,no,
+Heal and clone brush,retouch,should,yes,partial,tap-placed circular spots with draggable source; no freeform heal strokes
 Content-aware remove,retouch,could,yes,no,PatchMatch on CPU
 Blemish / dust spot auto-remove,retouch,could,yes,no,
 Versions (named snapshots),library,should,yes,no,
 Ratings flags color labels,library,must,yes,yes,editor Rate tab + 0-5/P/X/U keys; badges on library cells
 Albums,library,should,yes,no,
 Filter and search by rating/flag/date,library,should,yes,no,
-Export JPEG with quality and size,export,must,yes,partial,JPEG 95 only today
-Export PNG / TIFF / original,export,should,yes,no,framework encodes PNG; TIFF needs a writer
+Export JPEG with quality and size,export,must,yes,yes,quality 50-100; long edge full/4096/2048/1080; settings remembered
+Export PNG / TIFF / original,export,should,yes,partial,JPEG PNG WebP; no TIFF or original-file export
 Keep EXIF on export,export,must,yes,partial,dates camera lens exposure copied; GPS dropped (needs ACCESS_MEDIA_LOCATION)
 Full-resolution export beyond 4096px,export,must,yes,yes,2048px tiles; 6000x4000 source tested
 Watermark,export,could,yes,no,
-Share to other apps,export,should,yes,no,
+Share to other apps,export,should,yes,yes,Share in the export dialog hands the exported file to the system sheet
 DNG RAW,import,must,yes,partial,ImageDecoder decodes DNG; still untested (no sample on hand)
 Proprietary RAW (CR3 NEF ARW),import,could,yes,no,needs LibRaw native lib
 HDR editing and Ultra HDR export,hdr,could,yes,no,gainmap API 34+

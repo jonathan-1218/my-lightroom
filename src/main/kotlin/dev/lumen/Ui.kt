@@ -68,7 +68,8 @@ fun Context.textButton(label: String, onClick: () -> Unit) = Ui.type(TextView(th
 }
 
 /** Panel tabs. Selected tab: accent pill. TalkBack reads "selected". */
-class Tabs(ctx: Context, names: List<String>, private val onSelect: (Int) -> Unit) : HorizontalScrollView(ctx) {
+/** `initial` is selected (and reported) once at creation, so state the caller reads is never clobbered by chip 0. */
+class Tabs(ctx: Context, names: List<String>, initial: Int = 0, private val onSelect: (Int) -> Unit) : HorizontalScrollView(ctx) {
     private val chips = names.map { name ->
         Ui.type(TextView(ctx), "sm").apply {
             text = name
@@ -89,7 +90,7 @@ class Tabs(ctx: Context, names: List<String>, private val onSelect: (Int) -> Uni
                 addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = Ui.space(2) })
             }
         })
-        select(0)
+        select(initial.coerceIn(0, names.size - 1))
     }
 
     fun select(i: Int) {
@@ -184,7 +185,7 @@ fun Context.designGallery(): View {
         addView(textButton("Disabled") {}.apply { isEnabled = false })
     })
     heading("Tabs")
-    col.addView(Tabs(this, listOf("Light", "Color", "Effects", "Detail")) {}.apply { select(1) })
+    col.addView(Tabs(this, listOf("Light", "Color", "Effects", "Detail"), initial = 1) {})
     heading("Sliders")
     listOf(-50, 0, 75).forEach { p -> col.addView(SliderRow(this, "exposure") {}.apply { bar.progress = p }) }
     return android.widget.ScrollView(this).apply { setBackgroundColor(Ui.color("bg")); addView(col) }
