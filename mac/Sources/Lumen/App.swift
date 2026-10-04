@@ -6,6 +6,9 @@ import UniformTypeIdentifiers
 enum Entry {
     static func main() {
         if CommandLine.arguments.contains("--selftest") { exit(selfTest() ? 0 : 1) }
+        if let i = CommandLine.arguments.firstIndex(of: "--check"), CommandLine.arguments.count > i + 1 {
+            exit(checkFolder(URL(fileURLWithPath: CommandLine.arguments[i + 1])) ? 0 : 1)
+        }
         LumenApp.main()
     }
 }
@@ -256,7 +259,9 @@ final class AppModel: ObservableObject {
         saveWork?.cancel(); saveWork = nil
         guard let r = row else { return }
         let j = edit.json()
-        if j != r.edit { db.saveEdit(r.id, j); row?.edit = j; rows[current?.key ?? ""] = row }
+        guard j != r.edit else { return }
+        // only remember it as saved when it really is: a failed write is retried on the next change
+        if db.saveEdit(r.id, j) { row?.edit = j; rows[current?.key ?? ""] = row } else { say("Couldn't save your edits") }
     }
 
     func render() {
@@ -283,7 +288,7 @@ final class AppModel: ObservableObject {
 
     func mark(_ column: String, _ value: Any?) {
         guard var r = row else { return }
-        db.mark(r.id, column, value)
+        guard db.mark(r.id, column, value) else { return say("Couldn't save that") }
         switch column { case "rating": r.rating = value as! Int; case "flag": r.flag = value as! Int; default: r.label = value as? String }
         row = r; if let c = current { rows[c.key] = r }
     }
@@ -318,24 +323,45 @@ final class AppModel: ObservableObject {
     /// Runs `each(row id)` for every selected photo (creating rows as needed), then refreshes the grid.
     func batch(_ done: String, _ each: @escaping (Int64) -> Void) {
         let list = photos.filter { selection.contains($0.key) }
-        for p in list { each(db.open(key: p.key, uri: p.url.path, w: 1, h: 1).id) }
+        db.tx { for p in list { each(db.open(key: p.key, uri: p.url.path, w: 1, h: 1).id) }; return true } // one transaction: fast, all or nothing
         reloadRows(); say(String(format: done, list.count))
     }
 
     // MARK: import
 
+    /// At most 8 MB of a file as text (plenty for a LUT or a preset), or nil.
+    private func readCapped(_ url: URL) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url), let d = try? h.read(upToCount: 8 << 20) else { return nil }
+        try? h.close()
+        return String(decoding: d, as: UTF8.self)
+    }
+
     func importLUT(_ url: URL) {
-        do {
-            try Profiles.importCube(name: url.deletingPathExtension().lastPathComponent, text: String(contentsOf: url))
-            profiles = Profiles.names(); say("Profile \"\(url.deletingPathExtension().lastPathComponent)\" added")
-        } catch { say("Not a 3D .cube LUT: \(error.localizedDescription)") }
+        say("Importing…")
+        DispatchQueue.global(qos: .userInitiated).async { // parsing never blocks the window
+            let result = Result { () throws -> String in
+                guard let text = self.readCapped(url) else { throw LumenError("Couldn't read that file") }
+                return try Profiles.importCube(name: url.deletingPathExtension().lastPathComponent, text: text)
+            }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let saved): self.profiles = Profiles.names(); self.say("Profile \"\(saved)\" added")
+                case .failure(let error): self.say("Not a 3D .cube LUT: \(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     func importPreset(_ url: URL) {
-        guard let text = try? String(contentsOf: url), let (n, json) = xmpPreset(text, fallbackName: url.deletingPathExtension().lastPathComponent) else {
-            return say("No settings Lumen understands in that file")
+        say("Importing…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let parsed = self.readCapped(url).flatMap { xmpPreset($0, fallbackName: url.deletingPathExtension().lastPathComponent) }
+            DispatchQueue.main.async {
+                guard let (n, json) = parsed else { return self.say("No settings Lumen understands in that file") }
+                let saved = unique(n, self.db.presets().map(\.name)) // never replace a preset you already have
+                self.db.savePreset(saved, json); self.presets = self.db.presets(); self.say("Preset \"\(saved)\" added")
+            }
         }
-        db.savePreset(n, json); presets = db.presets(); say("Preset \"\(n)\" added")
     }
 
     // MARK: export

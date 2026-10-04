@@ -8,8 +8,20 @@ import android.net.Uri
 class Row(val id: Long, val edit: String, val rating: Int, val flag: Int, val label: String?)
 class Preset(val id: Long, val name: String, val edit: String)
 
-/** App-private SQLite. `name = null` gives an in-memory DB (self-test). */
+/** App-private SQLite. `name = null` gives an in-memory DB (self-test). Screens share one instance: `Db.get(context)`. */
 class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelper(ctx, name, null, 1) {
+    companion object {
+        @Volatile private var shared: Db? = null
+        fun get(ctx: Context): Db = shared ?: synchronized(this) { shared ?: Db(ctx.applicationContext).also { shared = it } }
+    }
+
+    /** All-or-nothing: batch work can't leave half the photos updated, and runs much faster. */
+    fun <T> tx(block: () -> T): T {
+        val d = writableDatabase
+        d.beginTransaction()
+        try { return block().also { d.setTransactionSuccessful() } } finally { d.endTransaction() }
+    }
+
     override fun onConfigure(db: SQLiteDatabase) = db.setForeignKeyConstraintsEnabled(true)
 
     override fun onCreate(db: SQLiteDatabase) =
@@ -22,15 +34,21 @@ class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelpe
     override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {}
 
     /** The photo's row, created on first open. */
-    fun open(key: String, uri: Uri, w: Int, h: Int): Row {
+    fun open(key: String, uri: Uri, w: Int, h: Int): Row = tx {
         val now = System.currentTimeMillis()
+        // Same file under a new key (its size changed, e.g. another app rewrote the metadata): keep its edits.
+        val known = readableDatabase.rawQuery("select 1 from photos where key = ?", arrayOf(key)).use { it.count > 0 }
+        if (!known) writableDatabase.execSQL("update photos set key = ? where uri = ? and not exists (select 1 from photos where key = ?)",
+            arrayOf(key, uri.toString(), key))
         writableDatabase.execSQL(
             "insert into photos (key, uri, added_at, updated_at, width, height) values (?,?,?,?,?,?) " +
-                "on conflict (key) do update set uri = excluded.uri",
-            arrayOf(key, uri.toString(), now, now, w, h))
+                "on conflict (key) do update set uri = excluded.uri, " +
+                "width = case when excluded.width > 1 then excluded.width else width end, " +
+                "height = case when excluded.height > 1 then excluded.height else height end",
+            arrayOf(key, uri.toString(), now, now, maxOf(1, w), maxOf(1, h)))
         readableDatabase.rawQuery("select id, edit, rating, flag, label from photos where key = ?", arrayOf(key)).use {
             it.moveToFirst()
-            return Row(it.getLong(0), it.getString(1), it.getInt(2), it.getInt(3), it.getString(4))
+            Row(it.getLong(0), it.getString(1), it.getInt(2), it.getInt(3), it.getString(4))
         }
     }
 
@@ -63,7 +81,7 @@ class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelpe
     // ---- S07 versions ----
     class Version(val id: Long, val name: String, val edit: String)
     fun versions(photo: Long): List<Version> = readableDatabase.rawQuery(
-        "select id, name, edit from versions where photo_id = ? order by created_at", arrayOf(photo.toString())).use { c ->
+        "select id, name, edit from versions where photo_id = ? order by created_at, id", arrayOf(photo.toString())).use { c ->
         buildList { while (c.moveToNext()) add(Version(c.getLong(0), c.getString(1), c.getString(2))) }
     }
     fun saveVersion(photo: Long, name: String, edit: String) = writableDatabase.execSQL(
@@ -94,7 +112,7 @@ class Db(private val ctx: Context, name: String? = "lumen.db") : SQLiteOpenHelpe
     fun deleteAlbum(id: Long) = writableDatabase.execSQL("delete from albums where id = ?", arrayOf(id))
     fun editOf(id: Long): String = readableDatabase.rawQuery("select edit from photos where id = ?", arrayOf(id.toString())).use { it.moveToFirst(); it.getString(0) }
 
-    fun presets(): List<Preset> = readableDatabase.rawQuery("select id, name, edit from presets order by created_at, name", null).use { c ->
+    fun presets(): List<Preset> = readableDatabase.rawQuery("select id, name, edit from presets order by created_at, name, id", null).use { c ->
         buildList { while (c.moveToNext()) add(Preset(c.getLong(0), c.getString(1), c.getString(2))) }
     }
 

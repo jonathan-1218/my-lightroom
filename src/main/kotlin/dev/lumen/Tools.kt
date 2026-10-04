@@ -201,12 +201,16 @@ class EditView(ctx: Context, private val onStart: () -> Unit, private val onChan
         when (m.type) {
             "brush" -> when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
+                    if (m.strokes.sumOf { it.pts.size } >= MAX_MASK_POINTS * 2) return // full: start a new mask
                     started = false; begin()
                     m.strokes = m.strokes + Stroke(floatArrayOf(u, v), brushSize, erase)
                     invalidate(); onChange()
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val s = m.strokes.last()
+                    val s = m.strokes.lastOrNull() ?: return
+                    // keep a point only when the finger has really moved, and stop at the cap: the edit stays small
+                    if (hypot(u - s.pts[s.pts.size - 2], v - s.pts[s.pts.size - 1]) < 0.002f) return
+                    if (m.strokes.sumOf { it.pts.size } >= MAX_MASK_POINTS * 2) return
                     m.strokes = m.strokes.dropLast(1) + Stroke(s.pts + floatArrayOf(u, v), s.size, s.erase)
                     invalidate(); onChange()
                 }

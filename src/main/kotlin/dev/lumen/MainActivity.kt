@@ -46,7 +46,7 @@ fun key(name: String?, size: Long, fallback: Uri) = if (name != null) "$name|$si
 class MainActivity : Activity() {
     private lateinit var view: EditView
     private val edit get() = view.edit
-    private val db by lazy { Db(this) }
+    private val db by lazy { Db.get(this) }
     private var row: Row? = null
     private var source: Uri? = null
     private val ui = Handler(Looper.getMainLooper())
@@ -62,10 +62,12 @@ class MainActivity : Activity() {
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
-        if (intent.getBooleanExtra("selftest", false)) return selfTest()
+        // Test switches: debug builds only, so other apps can't drive them on the installed app.
+        val debuggable = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (debuggable && intent.getBooleanExtra("selftest", false)) return selfTest()
         Ui.init(this)
         Profiles.init(this)
-        if (intent.getBooleanExtra("design", false)) return setContentView(designGallery().apply { fitInsets() })
+        if (debuggable && intent.getBooleanExtra("design", false)) return setContentView(designGallery().apply { fitInsets() })
         view = EditView(this, ::checkpoint, ::changed).apply { contentDescription = "Photo. Touch and hold to see the original." }
 
         val top = LinearLayout(this).apply {
@@ -108,7 +110,9 @@ class MainActivity : Activity() {
         })
         syncHistory()
         // Opened from the library, or from another app via "Edit with" / "Share" / "Open with".
-        (intent.data ?: intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))?.let(::load)
+        (intent.data ?: intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))?.let { uri ->
+            if (acceptable(uri)) load(uri) else toast("Can't open this file")
+        }
     }
 
     override fun onResume() { super.onResume(); if (::pasteBtn.isInitialized) pasteBtn.isEnabled = Clip.edit != null }
@@ -366,18 +370,24 @@ class MainActivity : Activity() {
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         val uri = data?.data ?: return
         if (res != RESULT_OK) return
-        val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { if (it.moveToFirst()) it.getString(0) else null }?.substringBeforeLast('.') ?: "Imported"
-        val text = runCatching {
-            contentResolver.openInputStream(uri)!!.use { s -> s.readNBytes(8 shl 20).toString(Charsets.UTF_8) } // 8 MB is plenty for a LUT
-        }.getOrElse { return toast("Couldn't read that file") }
-        when (req) {
-            2 -> runCatching { Profiles.importCube(name, text) }
-                .onSuccess { rebuildProfiles(); toast("Profile \"$name\" added") }
-                .onFailure { toast("Not a 3D .cube LUT: ${it.message}") }
-            3 -> xmpPreset(text, name)?.let { (n, json) -> db.savePreset(n, json); rebuildPresets(); toast("Preset \"$n\" added") }
-                ?: toast("No settings Lumen understands in that file")
-        }
+        toast("Importing…")
+        Thread { // parsing a large file must never block the screen
+            val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { if (it.moveToFirst()) it.getString(0) else null }?.substringBeforeLast('.') ?: "Imported"
+            val text = runCatching {
+                contentResolver.openInputStream(uri)!!.use { s -> s.readNBytes(8 shl 20).toString(Charsets.UTF_8) } // 8 MB is plenty for a LUT
+            }.getOrNull()
+            val message = when {
+                text == null -> "Couldn't read that file"
+                req == 2 -> runCatching { Profiles.importCube(name, text) }
+                    .fold({ runOnUiThread { rebuildProfiles() }; "Profile \"$it\" added" }, { "Not a 3D .cube LUT: ${it.message}" })
+                else -> runCatching { xmpPreset(text, name) }.getOrNull()?.let { (n, json) ->
+                    val saved = unique(n, db.presets().map { it.name }) // never replace a preset you already have
+                    db.savePreset(saved, json); runOnUiThread { rebuildPresets() }; "Preset \"$saved\" added"
+                } ?: "No settings Lumen understands in that file"
+            }
+            runOnUiThread { toast(message) }
+        }.start()
     }
 
     private fun presetsPanel(): View {
@@ -559,7 +569,7 @@ class MainActivity : Activity() {
         val result = runCatching {
             val (bmp, size) = decode(uri) { 2048f / maxOf(it.width, it.height) } // preview: the shader runs per screen pixel, 2048 is plenty
             Look(bmp) to db.open(keyOf(uri), uri, size.width, size.height)
-        }.onFailure { Log.w("Lumen", "open $uri", it) }.getOrNull()
+        }.onFailure { Log.w("Lumen", "open failed: ${it.javaClass.simpleName}") }.getOrNull()
         runOnUiThread {
             if (result == null) return@runOnUiThread toast("Can't open this file")
             ui.removeCallbacks(saveEdit)
@@ -573,6 +583,9 @@ class MainActivity : Activity() {
             rebuildVersions()
         }
     }.start()
+
+    /** Photos from other apps come as content:// from someone else's provider: never file:// paths, never our own files. */
+    private fun acceptable(uri: Uri) = uri.scheme == "content" && uri.authority?.startsWith(packageName) != true
 
     private fun keyOf(uri: Uri): String = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
         ?.use { if (it.moveToFirst()) key(it.getString(0), it.getLong(1), uri) else null } ?: uri.toString()
@@ -749,6 +762,42 @@ class MainActivity : Activity() {
         val again = d.open("a.jpg|1", Uri.parse("content://other"), 1, 1)
         checks["db"] = again.id == first.id && again.edit == j.toJson() && again.rating == 4 && d.marks().keys == setOf("a.jpg|1") &&
             d.presets().size == 6 && runCatching { d.mark(first.id, "rating", 9) }.isFailure
+
+        // hostile input (security review): nothing may crash; everything comes back finite and in range
+        val evil = listOf("", "[]", "null", "{", """{"light":{"exposure":"x","contrast":1e999}}""",
+            """{"geometry":{"rot90":-1,"crop":[0.9,0.9,0.1,0.1],"straighten":"x"}}""",
+            """{"masks":[{"type":"evil"},{"type":"brush","strokes":[{"p":[0.5],"size":1e9},{"p":[]}]},{"type":"radial","g":[0,0]}]}""",
+            """{"retouch":[[0.5,0.5,0.5,0.5,1e9,1],[1,2]],"profile":{"name":"../../databases/lumen","amount":"x"}}""",
+            """{"curve":{"rgb":[[0.5,0.5]],"r":[[2,-1],[0,0],["a",1]]}}""")
+        val tiny = solid(Color.rgb(120, 120, 120))
+        checks["hostile edits"] = evil.all { j ->
+            runCatching {
+                val e = Edit().merge(j)
+                e.v.all { it.isFinite() && it in -1f..1f } && e.rot90 in 0..3 && e.crop.width() > 0 && e.crop.height() > 0 &&
+                    e.retouch.all { it.r <= 0.2f } && e.profile == "Color" && e.masks.all { m -> m.strokes.all { it.pts.size >= 2 && it.pts.size % 2 == 0 } } &&
+                    Look(tiny).render(e).width > 0 && Edit().merge(e.toJson()).toJson() == e.toJson()
+            }.getOrDefault(false)
+        }
+        checks["hostile details"] = Edit().merge(evil[5]).rot90 == 3 &&
+            Edit().merge(evil[6]).masks.map { it.type } == listOf("brush", "radial") && Edit().merge(evil[6]).masks[0].strokes.isEmpty() &&
+            Edit().merge(evil[8]).curves[1] == listOf(0f to 0f, 1f to 0f)
+        val many = "<crs:ToneCurvePV2012><rdf:Seq>" + (0 until 300_000).joinToString("") { "<rdf:li>${it % 256}, ${it % 256}</rdf:li>" } +
+            "</rdf:Seq></crs:ToneCurvePV2012>"
+        val big = xmpPreset(many, "big")
+        checks["xmp size caps"] = big != null && big.second.length <= MAX_PRESET_JSON && Edit().merge(big.second).curves[0].size <= MAX_CURVE_POINTS
+        val t0 = System.nanoTime()
+        val slow = runCatching { xmpPreset("<crs:ToneCurvePV2012>".repeat(200_000) + "<crs:Name>".repeat(100_000), "slow") }
+        checks["xmp linear time"] = slow.isSuccess && (System.nanoTime() - t0) < 2_000_000_000L
+        checks["xmp bad numbers"] = runCatching {
+            xmpPreset("<crs:ToneCurvePV2012><rdf:li>., 5</rdf:li><rdf:li>${"9".repeat(400)}, 1</rdf:li></crs:ToneCurvePV2012> crs:Contrast2012=\"${"9".repeat(40)}\"", "x")
+        }.isSuccess
+        checks["only content uris"] = acceptable(Uri.parse("content://media/external/images/media/1")) &&
+            !acceptable(Uri.parse("file:///data/data/dev.lumen/databases/lumen.db")) && !acceptable(Uri.parse("content://dev.lumen.files/x"))
+        checks["unique names"] = unique("Mono", Profiles.names()) == "Mono (2)" && unique("New", listOf("Old")) == "New"
+        val moved = d.open("b.jpg|10", Uri.parse("content://x/1"), 400, 300)
+        val again2 = d.open("b.jpg|12", Uri.parse("content://x/1"), 1, 1) // same file, size changed after a metadata write
+        checks["db follows a resized file"] = again2.id == moved.id &&
+            d.readableDatabase.rawQuery("select width from photos where id = ?", arrayOf(moved.id.toString())).use { it.moveToFirst(); it.getInt(0) } == 400
 
         val ok = checks.values.all { it }
         Log.i("Lumen", "selftest ${if (ok) "PASS" else "FAIL ${checks.filterValues { !it }.keys}"} (${checks.size} checks) base=${Integer.toHexString(base)} bright=${Integer.toHexString(bright)} warm=${Integer.toHexString(warm)} red=${Integer.toHexString(red)}")

@@ -69,6 +69,8 @@ private class Cell(ctx: Context) : ImageView(ctx) {
 class LibraryActivity : Activity() {
     private val perms = if (Build.VERSION.SDK_INT >= 34) arrayOf(READ_MEDIA_IMAGES, READ_MEDIA_VISUAL_USER_SELECTED) else arrayOf(READ_MEDIA_IMAGES)
     private val pool = Executors.newFixedThreadPool(3)
+    private val batchQ = Executors.newSingleThreadExecutor()
+    private val failed = java.util.Collections.synchronizedSet(HashSet<String>()) // files that won't decode: don't retry on every scroll
     private val thumbs = object : LruCache<String, Bitmap>((Runtime.getRuntime().maxMemory() / 8).toInt()) {
         override fun sizeOf(k: String, b: Bitmap) = b.allocationByteCount
     }
@@ -79,7 +81,7 @@ class LibraryActivity : Activity() {
     private var filter = 0
     private var filters = listOf<Pair<String, (Photo) -> Boolean>>()
     private val selected = LinkedHashSet<String>()
-    private val db by lazy { Db(this) }
+    private val db by lazy { Db.get(this) }
     private var asked = false
     private lateinit var grid: GridView
     private lateinit var state: LinearLayout
@@ -249,8 +251,9 @@ class LibraryActivity : Activity() {
     /** Runs `each(photo, row id)` for every selected photo off the main thread, then refreshes. */
     private fun batch(done: String, each: (Photo, Long) -> Unit) {
         val list = chosen()
-        pool.execute {
-            list.forEach { p -> runCatching { each(p, db.ensure(p.key, p.uri, p.w, p.h)) }.onFailure { Log.w("Lumen", "batch ${p.key}", it) } }
+        batchQ.execute { // one batch at a time, each in one transaction: two quick batches can't overwrite each other
+            runCatching { db.tx { list.forEach { p -> each(p, db.ensure(p.key, p.uri, p.w, p.h)) } } }
+                .onFailure { Log.w("Lumen", "batch failed: ${it.javaClass.simpleName}") }
             runOnUiThread { toast(done.format(list.size)); selected.clear(); selectionChanged(); refresh() }
         }
     }
@@ -320,11 +323,11 @@ class LibraryActivity : Activity() {
     private fun edit(uri: Uri) = startActivity(Intent(this, MainActivity::class.java).setData(uri)
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
 
-    override fun onDestroy() { pool.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() { pool.shutdownNow(); batchQ.shutdown(); super.onDestroy() }
 
     /** Thumbnail with the edit applied, cached on disk by key + edit time. */
-    private fun editedThumb(p: Photo, json: String, at: Long): Bitmap? {
-        val file = java.io.File(cacheDir, "thumbs/${(p.key + at).hashCode().toUInt()}.jpg")
+    private fun editedThumb(p: Photo, json: String): Bitmap? {
+        val file = java.io.File(cacheDir, "thumbs/${sha256(p.key + "|" + json)}.jpg") // keyed by photo + edit: no collisions
         if (file.exists()) return android.graphics.BitmapFactory.decodeFile(file.path)
         val e = Edit().merge(json)
         val (src, _) = decode(p.uri) { s -> e.outSize(s.width, s.height).let { (w, h) -> 400f / minOf(w, h) } }
@@ -343,7 +346,7 @@ class LibraryActivity : Activity() {
             val cell = (old as? Cell) ?: Cell(this@LibraryActivity)
             val p = photos[i]
             val ed = edited[p.key]
-            val cacheKey = p.key + (ed?.second ?: "")
+            val cacheKey = p.key + "|" + (ed?.first?.let(::sha256) ?: "")
             cell.tag = cacheKey
             cell.mark = marks[p.key]
             cell.edited = ed != null
@@ -356,10 +359,10 @@ class LibraryActivity : Activity() {
             cell.invalidate()
             val hit = thumbs.get(cacheKey)
             cell.setImageBitmap(hit)
-            if (hit == null) pool.execute {
+            if (hit == null && cacheKey !in failed) pool.execute {
                 val b = runCatching {
-                    if (ed != null) editedThumb(p, ed.first, ed.second) else contentResolver.loadThumbnail(p.uri, Size(320, 320), null)
-                }.onFailure { Log.w("Lumen", "thumb ${p.key}", it) }.getOrNull() ?: return@execute
+                    if (ed != null) editedThumb(p, ed.first) else contentResolver.loadThumbnail(p.uri, Size(320, 320), null)
+                }.onFailure { failed.add(cacheKey) }.getOrNull() ?: return@execute
                 thumbs.put(cacheKey, b)
                 runOnUiThread { if (cell.tag == cacheKey) cell.setImageBitmap(b) } // cell may be recycled by now
             }

@@ -89,11 +89,13 @@ object Profiles {
         return Bitmap.createBitmap(px, n * n, n, Bitmap.Config.ARGB_8888)
     }
 
-    fun importCube(name: String, text: String) {
+    /** Saves the LUT under a name that is safe as a file name and not already taken (a built-in or an earlier import). */
+    fun importCube(name: String, text: String): String {
         val b = parseCube(text)
-        val clean = name.replace(Regex("[^A-Za-z0-9 _&().-]"), "").trim().ifEmpty { "Imported" }
+        val clean = unique(name.replace(Regex("[^A-Za-z0-9 _&().-]"), "").trim().take(60).ifEmpty { "Imported" }, names())
         File(dir!!, "$clean.png").outputStream().use { b.compress(Bitmap.CompressFormat.PNG, 100, it) }
         cache.remove(clean)
+        return clean
     }
 
     fun delete(name: String) { File(dir ?: return, "$name.png").delete(); cache.remove(name) }
@@ -103,12 +105,31 @@ object Profiles {
  * Reads a Lightroom / Camera Raw .xmp preset (the user's own file) into Lumen's edit JSON.
  * Settings Lumen has no equivalent for are skipped. Returns (name, edit json), or null if nothing usable was found.
  */
+fun sha256(s: String): String =
+    java.security.MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }
+
+/** `name`, or "name (2)", "name (3)"… — the first one not in `taken`. */
+fun unique(name: String, taken: Collection<String>): String =
+    if (name !in taken) name else (2..999).map { "$name ($it)" }.first { it !in taken }
+
+/** Text between `open` and the next `close`, found with indexOf: linear time whatever the file holds. */
+private fun between(text: String, open: String, close: String): String? {
+    val a = text.indexOf(open).takeIf { it >= 0 } ?: return null
+    val b = text.indexOf(close, a + open.length).takeIf { it >= 0 } ?: return null
+    return text.substring(a + open.length, b)
+}
+
+const val MAX_PRESET_JSON = 64 * 1024
+
 fun xmpPreset(text: String, fallbackName: String): Pair<String, String>? {
-    fun num(k: String): Float? =
-        (Regex("crs:$k=\"([-+0-9.]+)\"").find(text) ?: Regex("<crs:$k>([-+0-9.]+)</crs:$k>").find(text))?.groupValues?.get(1)?.toFloatOrNull()
+    // every numeric setting in two passes over the file (attributes, then elements), not one scan per setting
+    val values = HashMap<String, String>()
+    Regex("<crs:([A-Za-z0-9]{1,48})>([-+0-9.]{1,32})</crs:\\1>").findAll(text).forEach { values.putIfAbsent(it.groupValues[1], it.groupValues[2]) }
+    Regex("crs:([A-Za-z0-9]{1,48})=\"([-+0-9.]{1,32})\"").findAll(text).forEach { values[it.groupValues[1]] = it.groupValues[2] }
+    fun num(k: String): Float? = values[k]?.toFloatOrNull()?.takeIf { it.isFinite() }
     val e = Edit()
     var any = false
-    fun put(key: String, v: Float?) { if (v != null) { e[key] = v.coerceIn(-1f, 1f); any = true } }
+    fun put(key: String, v: Float?) { if (v != null && v.isFinite()) { e[key] = v.coerceIn(sliderRange(key)); any = true } }
     put("exposure", num("Exposure2012")?.div(2))              // ±2 EV is the full slider
     listOf("contrast" to "Contrast2012", "highlights" to "Highlights2012", "shadows" to "Shadows2012", "whites" to "Whites2012",
         "blacks" to "Blacks2012", "vibrance" to "Vibrance", "saturation" to "Saturation", "clarity" to "Clarity2012",
@@ -129,16 +150,20 @@ fun xmpPreset(text: String, fallbackName: String): Pair<String, String>? {
         put("${h}Lum", num("LuminanceAdjustment${names[i]}")?.div(100))
     }
     // Tone curves: <crs:ToneCurvePV2012><rdf:Seq><rdf:li>x, y</rdf:li>… in 0..255
+    val li = Regex("<rdf:li>\\s*([0-9.]{1,16})\\s*,\\s*([0-9.]{1,16})\\s*</rdf:li>")
     val curves = listOf("ToneCurvePV2012", "ToneCurvePV2012Red", "ToneCurvePV2012Green", "ToneCurvePV2012Blue").map { tag ->
-        Regex("<crs:$tag>(.*?)</crs:$tag>", RegexOption.DOT_MATCHES_ALL).find(text)?.groupValues?.get(1)?.let { body ->
-            Regex("<rdf:li>\\s*([0-9.]+)\\s*,\\s*([0-9.]+)\\s*</rdf:li>").findAll(body)
-                .map { it.groupValues[1].toFloat() / 255f to it.groupValues[2].toFloat() / 255f }.toList().takeIf { it.size >= 2 }
+        between(text, "<crs:$tag>", "</crs:$tag>")?.let { body ->
+            cleanCurve(li.findAll(body).take(MAX_CURVE_POINTS * 4).mapNotNull { m ->
+                val x = m.groupValues[1].toFloatOrNull() ?: return@mapNotNull null
+                val y = m.groupValues[2].toFloatOrNull() ?: return@mapNotNull null
+                x / 255f to y / 255f
+            }.toList())
         }
     }
     if (curves.any { it != null }) { e.curves = curves.mapIndexed { i, c -> c ?: e.curves[i] }; any = true }
     if (!any) return null
-    val name = Regex("<crs:Name>.*?<rdf:li[^>]*>(.*?)</rdf:li>", RegexOption.DOT_MATCHES_ALL).find(text)?.groupValues?.get(1)?.trim()
-        ?: Regex("crs:PresetName=\"([^\"]+)\"").find(text)?.groupValues?.get(1) ?: fallbackName
+    val name = (between(text, "<crs:Name>", "</crs:Name>")?.let { Regex("<rdf:li[^>]*>([^<]{1,200})</rdf:li>").find(it)?.groupValues?.get(1) }
+        ?: Regex("crs:PresetName=\"([^\"]{1,200})\"").find(text)?.groupValues?.get(1) ?: fallbackName).trim().take(60).ifEmpty { fallbackName }
     // Only the keys the preset actually set, so applying it leaves everything else alone (like a built-in preset).
     val full = JSONObject(e.toJson(whole = false))
     val base = JSONObject(Edit().toJson(whole = false))
@@ -151,6 +176,6 @@ fun xmpPreset(text: String, fallbackName: String): Pair<String, String>? {
             if (diff.length() > 0) out.put(sec, diff)
         }
     }
-    return name to out.toString()
+    return (name to out.toString()).takeIf { it.second.length <= MAX_PRESET_JSON }
 }
 

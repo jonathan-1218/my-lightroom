@@ -41,6 +41,21 @@ val SLIDERS = SECTIONS.values.flatten()
 private val IDX = SLIDERS.withIndex().associate { it.value to it.index }
 private val SCALARS = SECTIONS.filterKeys { it != "mixer" && it != "geometry" }.values.flatten()
 val CHANNELS = listOf("rgb", "r", "g", "b")
+
+// Limits for anything read back from JSON (the database, presets, paste): an edit can't grow without bound or carry junk.
+const val MAX_CURVE_POINTS = 64
+const val MAX_MASK_POINTS = 20000 // x,y pairs across all strokes of one brush mask
+const val MAX_SPOTS = 500
+private val UNIT_KEYS = setOf("shadowHue", "shadowSat", "midHue", "midSat", "highHue", "highSat") // 0..1, the rest -1..1
+fun sliderRange(k: String) = if (k in UNIT_KEYS) 0f..1f else -1f..1f
+private fun Double.fin(): Float? = toFloat().takeIf { it.isFinite() }
+private fun JSONArray.floats(): FloatArray? =
+    FloatArray(length()) { optDouble(it).toFloat() }.takeIf { a -> a.all { it.isFinite() } }
+
+/** Points sorted, inside 0..1, distinct x, at most MAX_CURVE_POINTS; null if fewer than 2 survive. */
+fun cleanCurve(pts: List<Pair<Float, Float>>): List<Pair<Float, Float>>? =
+    pts.filter { it.first.isFinite() && it.second.isFinite() }.map { it.first.coerceIn(0f, 1f) to it.second.coerceIn(0f, 1f) }
+        .sortedBy { it.first }.distinctBy { it.first }.take(MAX_CURVE_POINTS).takeIf { it.size >= 2 }
 val LINE = listOf(0f to 0f, 1f to 1f)
 
 // ---- masks: local adjustments. Coordinates are 0..1 of the source photo, so they stick to the content. ----
@@ -71,16 +86,27 @@ class Mask(val type: String) {
         }))
 
     companion object {
-        fun from(o: JSONObject) = Mask(o.getString("type")).apply {
-            o.optJSONArray("g")?.let { a -> g = FloatArray(4) { a.optDouble(it, 0.0).toFloat() } }
-            feather = o.optDouble("feather", 0.5).toFloat(); invert = o.optBoolean("invert"); range = o.optDouble("range", 0.3).toFloat()
-            o.optJSONObject("adjust")?.let { a -> MASK_ADJ.forEachIndexed { i, k -> adj[i] = a.optDouble(k, 0.0).toFloat() } }
-            strokes = o.optJSONArray("strokes")?.let { arr ->
-                (0 until arr.length()).map { arr.getJSONObject(it) }.map { s ->
-                    val pa = s.getJSONArray("p")
-                    Stroke(FloatArray(pa.length()) { pa.getDouble(it).toFloat() }, s.getDouble("size").toFloat(), s.optBoolean("erase"))
-                }
-            } ?: emptyList()
+        /** A mask from JSON, or null if it isn't one. Every number is checked and clamped. */
+        fun from(o: JSONObject): Mask? {
+            val t = o.optString("type").takeIf { it in MASK_TYPES } ?: return null
+            return Mask(t).apply {
+                o.optJSONArray("g")?.floats()?.takeIf { it.size == 4 }?.let { a -> g = FloatArray(4) { a[it].coerceIn(-2f, 2f) } }
+                if (t == "radial") { g[2] = g[2].coerceAtLeast(0.01f); g[3] = g[3].coerceAtLeast(0.01f) }
+                feather = o.optDouble("feather", 0.5).fin()?.coerceIn(0f, 1f) ?: 0.5f
+                invert = o.optBoolean("invert")
+                range = o.optDouble("range", 0.3).fin()?.coerceIn(0.05f, 0.6f) ?: 0.3f
+                o.optJSONObject("adjust")?.let { a -> MASK_ADJ.forEachIndexed { i, k -> adj[i] = a.optDouble(k, 0.0).fin()?.coerceIn(-1f, 1f) ?: 0f } }
+                var budget = MAX_MASK_POINTS * 2
+                strokes = o.optJSONArray("strokes")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.mapNotNull { st ->
+                        val pts = st.optJSONArray("p")?.floats() ?: return@mapNotNull null
+                        val n = minOf(pts.size - pts.size % 2, budget)
+                        if (n < 2) return@mapNotNull null
+                        budget -= n
+                        Stroke(FloatArray(n) { pts[it].coerceIn(-1f, 2f) }, st.optDouble("size").fin()?.coerceIn(0.001f, 0.5f) ?: 0.05f, st.optBoolean("erase"))
+                    }
+                } ?: emptyList()
+            }
         }
     }
 }
@@ -129,30 +155,37 @@ class Edit {
 
     /** Overlay whatever keys `json` has (a preset sets only what it names). Crop, masks and spots only when `whole`. */
     fun merge(json: String, whole: Boolean = true): Edit = apply {
-        val o = JSONObject(json)
+        val o = runCatching { JSONObject(json) }.getOrNull() ?: return@apply // not JSON: leave the edit as it is
         SECTIONS.forEach { (s, names) ->
             if (s == "geometry") return@forEach
             val sec = o.optJSONObject(s) ?: return@forEach
-            names.forEach { if (sec.has(it)) set(it, sec.getDouble(it).toFloat()) }
+            names.forEach { k -> if (sec.has(k)) sec.optDouble(k).fin()?.let { set(k, it.coerceIn(sliderRange(k))) } }
         }
-        o.optJSONObject("profile")?.let { pr -> profile = pr.optString("name", profile); profileAmount = pr.optDouble("amount", 1.0).toFloat() }
+        o.optJSONObject("profile")?.let { pr ->
+            pr.optString("name").takeIf { it in Profiles.names() }?.let { profile = it } // only profiles that exist: no paths
+            profileAmount = pr.optDouble("amount", 1.0).fin()?.coerceIn(0f, 1f) ?: 1f
+        }
         o.optJSONObject("curve")?.let { c ->
             curves = CHANNELS.mapIndexed { i, ch ->
-                c.optJSONArray(ch)?.let { a -> (0 until a.length()).map { a.getJSONArray(it).let { p -> p.getDouble(0).toFloat() to p.getDouble(1).toFloat() } } }
-                    ?.takeIf { it.size >= 2 } ?: curves[i]
+                c.optJSONArray(ch)?.let { a ->
+                    cleanCurve((0 until a.length()).mapNotNull { a.optJSONArray(it)?.floats()?.takeIf { p -> p.size == 2 }?.let { p -> p[0] to p[1] } })
+                } ?: curves[i]
             }
         }
         val g = o.optJSONObject("geometry")
-        if (whole) o.optJSONArray("masks")?.let { a -> masks = (0 until a.length()).map { Mask.from(a.getJSONObject(it)) }.take(MAX_MASKS) }
+        if (whole) o.optJSONArray("masks")?.let { a -> masks = (0 until a.length()).mapNotNull { a.optJSONObject(it)?.let(Mask::from) }.take(MAX_MASKS) }
         if (whole) o.optJSONArray("retouch")?.let { a ->
-            retouch = (0 until a.length()).map { a.getJSONArray(it) }.map { s ->
-                Spot(s.getDouble(0).toFloat(), s.getDouble(1).toFloat(), s.getDouble(2).toFloat(), s.getDouble(3).toFloat(), s.getDouble(4).toFloat(), s.getDouble(5) > 0.5)
+            retouch = (0 until a.length()).mapNotNull { a.optJSONArray(it)?.floats()?.takeIf { s -> s.size == 6 } }.take(MAX_SPOTS).map { s ->
+                Spot(s[0].coerceIn(0f, 1f), s[1].coerceIn(0f, 1f), s[2].coerceIn(0f, 1f), s[3].coerceIn(0f, 1f), s[4].coerceIn(0.001f, 0.2f), s[5] > 0.5f)
             }
         }
         if (whole && g != null) {
-            listOf("straighten", "vertical", "horizontal").forEach { if (g.has(it)) set(it, g.getDouble(it).toFloat()) }
-            g.optJSONArray("crop")?.let { crop = RectF(it.getDouble(0).toFloat(), it.getDouble(1).toFloat(), it.getDouble(2).toFloat(), it.getDouble(3).toFloat()) }
-            rot90 = g.optInt("rot90", rot90)
+            listOf("straighten", "vertical", "horizontal").forEach { k -> if (g.has(k)) g.optDouble(k).fin()?.let { set(k, it.coerceIn(-1f, 1f)) } }
+            g.optJSONArray("crop")?.floats()?.takeIf { it.size == 4 }?.let { c ->
+                val l = c[0].coerceIn(0f, 0.95f); val t = c[1].coerceIn(0f, 0.95f)
+                crop = RectF(l, t, c[2].coerceIn(l + 0.05f, 1f), c[3].coerceIn(t + 0.05f, 1f))
+            }
+            rot90 = g.optInt("rot90", rot90).mod(4)
             flipH = g.optBoolean("flipH", flipH)
         }
     }

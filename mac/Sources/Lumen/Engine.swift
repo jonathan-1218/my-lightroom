@@ -298,7 +298,7 @@ enum Profiles {
 
     /// The LUT strip and its size, or nil for "Color" / unknown names.
     static func lut(_ name: String) -> (CIImage, Int)? {
-        if name == "Color" { return nil }
+        if name == "Color" || !names().contains(name) { return nil } // only real profiles: a name is never a path
         if let c = cache[name] { return c }
         var out: (CIImage, Int)?
         if let f = builtIn.first(where: { $0.0 == name })?.1 {
@@ -323,14 +323,17 @@ enum Profiles {
             switch parts[0].uppercased() {
             case "TITLE": continue
             case "LUT_1D_SIZE": throw LumenError("1D LUTs aren't supported, only 3D")
-            case "LUT_3D_SIZE": n = Int(parts[1]) ?? 0
-            case "DOMAIN_MIN": lo = parts.dropFirst().compactMap { Float($0) }
-            case "DOMAIN_MAX": hi = parts.dropFirst().compactMap { Float($0) }
-            default: let v = parts.compactMap { Float($0) }; if v.count == 3 { rows.append(v) }
+            case "LUT_3D_SIZE": n = parts.count >= 2 ? Int(parts[1]) ?? 0 : 0
+            case "DOMAIN_MIN", "DOMAIN_MAX":
+                let v = parts.dropFirst().compactMap { Float($0) }.filter(\.isFinite)
+                guard v.count == 3 else { throw LumenError("\(parts[0]) needs 3 numbers") }
+                if parts[0].uppercased() == "DOMAIN_MIN" { lo = v } else { hi = v }
+            default: let v = parts.compactMap { Float($0) }.filter(\.isFinite); if v.count == 3 { rows.append(v) }
             }
         }
         guard (2...64).contains(n) else { throw LumenError("LUT size must be 2 to 64, this file says \(n)") }
         guard rows.count == n * n * n else { throw LumenError("Expected \(n * n * n) colour rows, found \(rows.count)") }
+        guard (0..<3).allSatisfy({ hi[$0] > lo[$0] }) else { throw LumenError("DOMAIN_MAX must be above DOMAIN_MIN") }
         var px = [UInt8](repeating: 255, count: n * n * n * 4)
         for (i, v) in rows.enumerated() {
             let r = i % n, g = (i / n) % n, b = i / (n * n)
@@ -340,17 +343,26 @@ enum Profiles {
         return (px, n)
     }
 
-    static func importCube(name: String, text: String) throws {
+    /// Saves the LUT under a name that is safe as a file name and not already taken (a built-in or an earlier import).
+    @discardableResult
+    static func importCube(name: String, text: String) throws -> String {
         let (px, n) = try parseCube(text)
-        let clean = String(name.filter { $0.isLetter || $0.isNumber || " _&().-".contains($0) }).trimmingCharacters(in: .whitespaces)
-        let file = dir.appendingPathComponent("\(clean.isEmpty ? "Imported" : clean).png")
+        let safe = String(name.filter { $0.isASCII && ($0.isLetter || $0.isNumber || " _&().-".contains($0)) }.prefix(60)).trimmingCharacters(in: .whitespaces)
+        let clean = unique(safe.isEmpty ? "Imported" : safe, names())
+        let file = dir.appendingPathComponent("\(clean).png")
         let ctx = CGContext(data: UnsafeMutableRawPointer(mutating: px), width: n * n, height: n, bitsPerComponent: 8, bytesPerRow: n * n * 4,
                             space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         let dest = CGImageDestinationCreateWithURL(file as CFURL, UTType.png.identifier as CFString, 1, nil)!
         CGImageDestinationAddImage(dest, ctx.makeImage()!, nil)
         guard CGImageDestinationFinalize(dest) else { throw LumenError("Couldn't save the profile") }
         cache[clean] = nil
+        return clean
     }
+}
+
+/// `name`, or "name (2)", "name (3)"… — the first one not in `taken`.
+func unique(_ name: String, _ taken: [String]) -> String {
+    taken.contains(name) ? (2...999).map { "\(name) (\($0))" }.first { !taken.contains($0) }! : name
 }
 
 struct LumenError: LocalizedError { let message: String; init(_ m: String) { message = m }; var errorDescription: String? { message } }
@@ -554,6 +566,18 @@ final class Look {
             img = img.cropped(to: CGRect(x: 0, y: 0, width: img.extent.width.rounded(.down), height: img.extent.height.rounded(.down)))
         }
         return ciContext.createCGImage(img, from: img.extent, format: .RGBA8, colorSpace: sRGB)!
+    }
+
+    /// render, but nil instead of a crash when the GPU can't allocate the image (huge exports)
+    func renderOrNil(_ e: Edit, maxLong: Double = 0) -> CGImage? {
+        var img = image(e)
+        let long = Double(max(img.extent.width, img.extent.height))
+        if maxLong > 0 && long > maxLong {
+            let k = maxLong / long
+            img = img.transformed(by: CGAffineTransform(scaleX: k, y: k))
+            img = img.cropped(to: CGRect(x: 0, y: 0, width: img.extent.width.rounded(.down), height: img.extent.height.rounded(.down)))
+        }
+        return ciContext.createCGImage(img, from: img.extent, format: .RGBA8, colorSpace: sRGB)
     }
 }
 

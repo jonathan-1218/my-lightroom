@@ -28,7 +28,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PLIST
-codesign --force --sign - "$APP" # ad-hoc: fine for this Mac; a Developer ID is needed to hand the app to others
+codesign --force --options runtime --sign - "$APP" # ad-hoc + hardened runtime (no code injection); a Developer ID is needed to hand it to others
 "$APP/Contents/MacOS/Lumen" --selftest
 du -sh "$APP" | cut -f1 | sed 's/^/app size: /'
 if [ "${1:-}" = install ]; then rm -rf /Applications/Lumen.app; cp -R "$APP" /Applications/; echo "installed to /Applications/Lumen.app"; fi

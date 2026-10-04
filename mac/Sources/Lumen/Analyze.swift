@@ -127,16 +127,30 @@ func histogram(_ cg: CGImage) -> [[Int]] {
     return h
 }
 
-/// Reads a Lightroom / Camera Raw .xmp preset (the user's own file) into Lumen's edit JSON, only the keys it sets.
-func xmpPreset(_ text: String, fallbackName: String) -> (String, String)? {
-    func first(_ pattern: String) -> String? {
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]),
-              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)), let r = Range(m.range(at: 1), in: text) else { return nil }
-        return String(text[r])
+/// Text between `open` and the next `close`, found by plain search: linear time whatever the file holds.
+private func between(_ text: String, _ open: String, _ close: String) -> String? {
+    guard let a = text.range(of: open), let b = text.range(of: close, range: a.upperBound..<text.endIndex) else { return nil }
+    return String(text[a.upperBound..<b.lowerBound])
+}
+
+private func matches(_ pattern: String, _ text: String) -> [[String]] {
+    guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+    let ns = text as NSString
+    return re.matches(in: text, range: NSRange(location: 0, length: ns.length)).map { m in
+        (0..<m.numberOfRanges).map { m.range(at: $0).location == NSNotFound ? "" : ns.substring(with: m.range(at: $0)) }
     }
-    func num(_ k: String) -> Float? { (first("crs:\(k)=\"([-+0-9.]+)\"") ?? first("<crs:\(k)>([-+0-9.]+)</crs:\(k)>")).flatMap { Float($0) } }
+}
+
+/// Reads a Lightroom / Camera Raw .xmp preset (the user's own file) into Lumen's edit JSON, only the keys it sets.
+/// Linear time, capped sizes, never crashes on bad numbers (same rules as the Android importer).
+func xmpPreset(_ text: String, fallbackName: String) -> (String, String)? {
+    // every numeric setting in two passes over the file (elements, then attributes), not one scan per setting
+    var values = [String: String]()
+    for m in matches("<crs:([A-Za-z0-9]{1,48})>([-+0-9.]{1,32})</crs:\\1>", text) where values[m[1]] == nil { values[m[1]] = m[2] }
+    for m in matches("crs:([A-Za-z0-9]{1,48})=\"([-+0-9.]{1,32})\"", text) { values[m[1]] = m[2] }
+    func num(_ k: String) -> Float? { values[k].flatMap { Float($0) }.flatMap { $0.isFinite ? $0 : nil } }
     var e = Edit(), any = false
-    func put(_ k: String, _ v: Float?) { if let v { e[k] = min(1, max(-1, v)); any = true } }
+    func put(_ k: String, _ v: Float?) { if let v, v.isFinite { e[k] = v.clamped(sliderRange(k)); any = true } }
     put("exposure", num("Exposure2012").map { $0 / 2 })
     for (k, x) in [("contrast", "Contrast2012"), ("highlights", "Highlights2012"), ("shadows", "Shadows2012"), ("whites", "Whites2012"),
                    ("blacks", "Blacks2012"), ("vibrance", "Vibrance"), ("saturation", "Saturation"), ("clarity", "Clarity2012"),
@@ -158,16 +172,19 @@ func xmpPreset(_ text: String, fallbackName: String) -> (String, String)? {
         put("\(hue)Lum", num("LuminanceAdjustment\(names[i])").map { $0 / 100 })
     }
     let curves = ["ToneCurvePV2012", "ToneCurvePV2012Red", "ToneCurvePV2012Green", "ToneCurvePV2012Blue"].map { tag -> [CGPoint]? in
-        guard let body = first("<crs:\(tag)>(.*?)</crs:\(tag)>"), let re = try? NSRegularExpression(pattern: "<rdf:li>\\s*([0-9.]+)\\s*,\\s*([0-9.]+)\\s*</rdf:li>") else { return nil }
-        let pts = re.matches(in: body, range: NSRange(body.startIndex..., in: body)).compactMap { m -> CGPoint? in
-            guard let a = Range(m.range(at: 1), in: body), let b = Range(m.range(at: 2), in: body), let x = Double(body[a]), let y = Double(body[b]) else { return nil }
+        guard let body = between(text, "<crs:\(tag)>", "</crs:\(tag)>") else { return nil }
+        let pts = matches("<rdf:li>\\s*([0-9.]{1,16})\\s*,\\s*([0-9.]{1,16})\\s*</rdf:li>", body).prefix(MAX_CURVE_POINTS * 4).compactMap { m -> CGPoint? in
+            guard let x = Double(m[1]), let y = Double(m[2]) else { return nil }
             return CGPoint(x: x / 255, y: y / 255)
         }
-        return pts.count >= 2 ? pts : nil
+        return cleanCurve(Array(pts))
     }
     if curves.contains(where: { $0 != nil }) { e.curves = curves.enumerated().map { $1 ?? e.curves[$0] }; any = true }
     guard any else { return nil }
-    let name = first("<crs:Name>.*?<rdf:li[^>]*>(.*?)</rdf:li>")?.trimmingCharacters(in: .whitespaces) ?? first("crs:PresetName=\"([^\"]+)\"") ?? fallbackName
+    let raw = between(text, "<crs:Name>", "</crs:Name>").flatMap { matches("<rdf:li[^>]*>([^<]{1,200})</rdf:li>", $0).first?[1] }
+        ?? matches("crs:PresetName=\"([^\"]{1,200})\"", text).first?[1] ?? fallbackName
+    let trimmed = String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
+    let name = trimmed.isEmpty ? fallbackName : trimmed
     // Only the keys the preset actually set, so applying it leaves everything else alone (like a built-in preset).
     let full = (try? JSONSerialization.jsonObject(with: Data(e.json(whole: false).utf8))) as? [String: Any] ?? [:]
     let base = (try? JSONSerialization.jsonObject(with: Data(Edit().json(whole: false).utf8))) as? [String: Any] ?? [:]
@@ -177,5 +194,6 @@ func xmpPreset(_ text: String, fallbackName: String) -> (String, String)? {
         let diff = a.filter { k, v in "\(v)" != "\(b[k] ?? "")" }
         if !diff.isEmpty { out[sec] = diff }
     }
-    return (name, String(decoding: try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]), as: UTF8.self))
+    let json = String(decoding: try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]), as: UTF8.self)
+    return json.utf8.count <= MAX_PRESET_JSON ? (name, json) : nil
 }

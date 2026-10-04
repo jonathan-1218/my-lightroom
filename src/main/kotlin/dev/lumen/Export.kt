@@ -30,11 +30,12 @@ class ExportOptions(val format: String, val long: Int, val quality: Int, val met
     companion object {
         fun saved(ctx: Context) = ctx.getSharedPreferences("export", Context.MODE_PRIVATE).run {
             ExportOptions(getString("format", "JPEG")!!, getInt("long", 0), getInt("quality", 92), getBoolean("meta", true),
-                getBoolean("location", false), getString("watermark", "")!!)
+                false, getString("watermark", "")!!)
         }
     }
     fun save(ctx: Context) = ctx.getSharedPreferences("export", Context.MODE_PRIVATE).edit().putString("format", format).putInt("long", long)
-        .putInt("quality", quality).putBoolean("meta", meta).putBoolean("location", location).putString("watermark", watermark).apply()
+        .putInt("quality", quality).putBoolean("meta", meta).putString("watermark", watermark).apply()
+    // ponytail: "Keep location" is deliberately not remembered: GPS goes out only when asked for this export
 }
 
 private val EXIF_TAGS = listOf(
@@ -83,6 +84,7 @@ fun Context.exportPhoto(source: Uri, e: Edit, o: ExportOptions): Pair<Uri, Size>
     val dest = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
     val ok = contentResolver.openOutputStream(dest)?.use { out.compress(fmt, o.quality, it) } == true
     if (ok && o.meta) runCatching { copyExif(source, dest, o.location) }.onFailure { Log.w("Lumen", "exif", it) } // metadata is best effort
+    if (!ok) { contentResolver.delete(dest, null, null); return null } // no half-written file in Pictures/Lumen
     contentResolver.update(dest, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
     return if (ok) dest to Size(out.width, out.height) else null
 }

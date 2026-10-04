@@ -140,7 +140,57 @@ func selfTest() -> Bool {
     let alb = d.createAlbum("Trip"); d.setInAlbum(alb, first.id, true)
     check("versions + albums", d.versions(first.id).count == 1 && d.albumKeys(alb) == ["a.jpg|1"])
 
+    // hostile input (security review): nothing may crash; everything comes back finite and in range
+    let evil = ["", "[]", "null", "{", #"{"light":{"exposure":"x","contrast":1e999}}"#,
+                #"{"geometry":{"rot90":-1,"crop":[0.9,0.9,0.1,0.1],"straighten":"x"}}"#,
+                #"{"masks":[{"type":"evil"},{"type":"brush","strokes":[{"p":[0.5],"size":1e9},{"p":[]}]},{"type":"radial","g":[0,0]}]}"#,
+                #"{"retouch":[[0.5,0.5,0.5,0.5,1e9,1],[1,2]],"profile":{"name":"../../databases/lumen","amount":"x"}}"#,
+                #"{"curve":{"rgb":[[0.5,0.5]],"r":[[2,-1],[0,0],["a",1]]}}"#]
+    let tiny = solid(120, 120, 120)
+    check("hostile edits", evil.allSatisfy { j in
+        var e = Edit(); e.merge(j)
+        var again = Edit(); again.merge(e.json())
+        return e.v.values.allSatisfy { $0.isFinite && (-1...1).contains($0) } && (0...3).contains(e.rot90) && e.crop.width > 0 && e.crop.height > 0
+            && e.retouch.allSatisfy { $0.r <= 0.2 } && e.profile == "Color" && e.masks.allSatisfy { $0.strokes.allSatisfy { $0.pts.count >= 2 && $0.pts.count % 2 == 0 } }
+            && Look(tiny).render(e).width > 0 && again.json() == e.json()
+    })
+    func merged(_ j: String) -> Edit { var e = Edit(); e.merge(j); return e }
+    check("hostile details", merged(evil[5]).rot90 == 3 && merged(evil[6]).masks.map(\.type) == ["brush", "radial"] && merged(evil[6]).masks[0].strokes.isEmpty
+        && merged(evil[8]).curves[1] == [CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 0)])
+    let many = "<crs:ToneCurvePV2012><rdf:Seq>" + (0..<300_000).map { "<rdf:li>\($0 % 256), \($0 % 256)</rdf:li>" }.joined() + "</rdf:Seq></crs:ToneCurvePV2012>"
+    let big = xmpPreset(many, fallbackName: "big")
+    check("xmp size caps", big.map { $0.1.utf8.count <= MAX_PRESET_JSON && merged($0.1).curves[0].count <= MAX_CURVE_POINTS } ?? false)
+    let t0 = Date()
+    _ = xmpPreset(String(repeating: "<crs:ToneCurvePV2012>", count: 200_000) + String(repeating: "<crs:Name>", count: 100_000), fallbackName: "slow")
+    check("xmp linear time", Date().timeIntervalSince(t0) < 2)
+    check("xmp bad numbers", xmpPreset("<crs:ToneCurvePV2012><rdf:li>., 5</rdf:li><rdf:li>\(String(repeating: "9", count: 400)), 1</rdf:li></crs:ToneCurvePV2012> crs:Contrast2012=\"\(String(repeating: "9", count: 40))\"", fallbackName: "x").map { merged($0.1).json().count > 0 } ?? true)
+    check("cube bad input", ["LUT_3D_SIZE", "LUT_3D_SIZE 2\nDOMAIN_MIN 0", "LUT_3D_SIZE 2\nDOMAIN_MAX 0 0 0\n" + String(repeating: "0 0 0\n", count: 8)].allSatisfy { (try? Profiles.parseCube($0)) == nil })
+    check("unique names", unique("Mono", Profiles.names()) == "Mono (2)" && unique("New", ["Old"]) == "New")
+    let moved = d.open(key: "b.jpg|10", uri: "/x/b.jpg", w: 400, h: 300)
+    let again2 = d.open(key: "b.jpg|12", uri: "/x/b.jpg", w: 1, h: 1) // same file, size changed after a metadata write
+    check("db follows a resized file", again2.id == moved.id && d.query("select width from photos where id = ?", [moved.id]) { $0.int(0) }.first == 400)
+    check("db transaction rolls back", !d.tx { d.saveEdit(moved.id, "{\"v\":1,\"light\":{\"exposure\":0.5}}"); return false } && d.editOf(moved.id) == "{\"v\":1}")
+
     let failed = checks.filter { !$0.1 }.map(\.0)
     print("selftest \(failed.isEmpty ? "PASS" : "FAIL \(failed)") (\(checks.count) checks) base=\(base) bright=\(bright) warm=\(warm) red=\(red) level=\(level)")
     return failed.isEmpty
+}
+
+/// `Lumen --check <folder>`: every photo the library would show goes through the same decode, develop and thumbnail path.
+/// Bad files must come back as "can't open", never a crash.
+func checkFolder(_ folder: URL) -> Bool {
+    let photos = scan([folder])
+    var e = Edit(); e["exposure"] = 0.2; e["clarity"] = 0.3; e["noise"] = 0.5; e["straighten"] = 0.1
+    e.masks = [{ var m = Mask(type: "radial"); m.g = [0.5, 0.5, 0.3, 0.3]; m.adj[0] = 0.5; return m }()]
+    var opened = 0
+    for p in photos {
+        let t0 = Date()
+        guard let cg = decode(p.url, maxPixel: 2048) else { print("can't open  \(p.url.lastPathComponent)"); continue }
+        let out = Look(cg).render(e, maxLong: 1024)
+        _ = Thumbs.get(p, edit: nil)
+        opened += 1
+        print(String(format: "ok %5.0f ms  %dx%d → %dx%d  %@", Date().timeIntervalSince(t0) * 1000, cg.width, cg.height, out.width, out.height, p.url.lastPathComponent))
+    }
+    print("\(opened) of \(photos.count) opened, the rest refused cleanly")
+    return true
 }

@@ -20,6 +20,29 @@ let CHANNELS = ["rgb", "r", "g", "b"]
 let LINE: [CGPoint] = [CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 1)]
 
 let MAX_MASKS = 4 // shader slots, same as Android
+// Limits for anything read back from JSON (the database, presets, paste), the same as Android's.
+let MAX_CURVE_POINTS = 64
+let MAX_MASK_POINTS = 20000 // x,y pairs across all strokes of one brush mask
+let MAX_SPOTS = 500
+let MAX_PRESET_JSON = 64 * 1024
+private let UNIT_KEYS: Set<String> = ["shadowHue", "shadowSat", "midHue", "midSat", "highHue", "highSat"] // 0...1, the rest -1...1
+func sliderRange(_ k: String) -> ClosedRange<Float> { UNIT_KEYS.contains(k) ? 0...1 : -1...1 }
+extension Comparable { func clamped(_ r: ClosedRange<Self>) -> Self { min(r.upperBound, max(r.lowerBound, self)) } }
+/// A finite Float from a JSON value, or nil (strings, infinities and NaN are dropped).
+func fin(_ v: Any?) -> Float? { (v as? NSNumber).map { Float(truncating: $0) }.flatMap { $0.isFinite ? $0 : nil } } // JSON 0/1 also bridge as Bool: keep them
+private func floats(_ v: Any?) -> [Float]? {
+    guard let a = v as? [Any] else { return nil }
+    let f = a.compactMap(fin)
+    return f.count == a.count ? f : nil
+}
+
+/// Points sorted, inside 0...1, distinct x, at most MAX_CURVE_POINTS; nil if fewer than 2 survive.
+func cleanCurve(_ pts: [CGPoint]) -> [CGPoint]? {
+    var seen = Set<Double>()
+    let c = pts.filter { $0.x.isFinite && $0.y.isFinite }.map { CGPoint(x: $0.x.clamped(0...1), y: $0.y.clamped(0...1)) }
+        .sorted { $0.x < $1.x }.filter { seen.insert(Double($0.x)).inserted }.prefix(MAX_CURVE_POINTS)
+    return c.count >= 2 ? Array(c) : nil
+}
 let MASK_TYPES = ["linear", "radial", "brush", "color", "luma"]
 let MASK_ADJ = ["exposure", "contrast", "highlights", "shadows", "temp", "tint", "saturation", "clarity"]
 
@@ -42,17 +65,23 @@ struct Mask: Equatable {
          "strokes": strokes.map { ["size": Double($0.size), "erase": $0.erase, "p": $0.pts.map(Double.init)] }]
     }
 
+    /// A mask from JSON, or nil if it isn't one. Every number is checked and clamped.
     static func from(_ o: [String: Any]) -> Mask? {
-        guard let t = o["type"] as? String else { return nil }
+        guard let t = o["type"] as? String, MASK_TYPES.contains(t) else { return nil }
         var m = Mask(type: t)
-        if let a = o["g"] as? [Double], a.count == 4 { m.g = a.map(Float.init) }
-        m.feather = Float(o["feather"] as? Double ?? 0.5)
+        if let a = floats(o["g"]), a.count == 4 { m.g = a.map { $0.clamped(-2...2) } }
+        if t == "radial" { m.g[2] = max(0.01, m.g[2]); m.g[3] = max(0.01, m.g[3]) }
+        m.feather = fin(o["feather"])?.clamped(0...1) ?? 0.5
         m.invert = o["invert"] as? Bool ?? false
-        m.range = Float(o["range"] as? Double ?? 0.3)
-        if let a = o["adjust"] as? [String: Double] { m.adj = MASK_ADJ.map { Float(a[$0] ?? 0) } }
+        m.range = fin(o["range"])?.clamped(0.05...0.6) ?? 0.3
+        if let a = o["adjust"] as? [String: Any] { m.adj = MASK_ADJ.map { fin(a[$0])?.clamped(-1...1) ?? 0 } }
+        var budget = MAX_MASK_POINTS * 2
         m.strokes = (o["strokes"] as? [[String: Any]] ?? []).compactMap { s in
-            guard let p = s["p"] as? [Double], let size = s["size"] as? Double else { return nil }
-            return Stroke(pts: p.map(Float.init), size: Float(size), erase: s["erase"] as? Bool ?? false)
+            guard let p = floats(s["p"]) else { return nil }
+            let n = min(p.count - p.count % 2, budget)
+            guard n >= 2 else { return nil }
+            budget -= n
+            return Stroke(pts: p.prefix(n).map { $0.clamped(-1...2) }, size: fin(s["size"])?.clamped(0.001...0.5) ?? 0.05, erase: s["erase"] as? Bool ?? false)
         }
         return m
     }
@@ -102,30 +131,41 @@ struct Edit: Equatable {
     /// Overlay whatever keys `json` has (a preset sets only what it names). Crop, masks and spots only when `whole`.
     @discardableResult
     mutating func merge(_ json: String, whole: Bool = true) -> Edit {
-        guard let o = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] else { return self }
+        guard let o = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] else { return self } // not JSON: unchanged
         for (s, names) in SECTIONS where s != "geometry" {
             guard let sec = o[s] as? [String: Any] else { continue }
-            for n in names { if let x = sec[n] as? Double { self[n] = Float(x) } }
+            for n in names { if let x = fin(sec[n]) { self[n] = x.clamped(sliderRange(n)) } }
         }
         if let pr = o["profile"] as? [String: Any] {
-            profile = pr["name"] as? String ?? profile
-            profileAmount = Float(pr["amount"] as? Double ?? 1)
+            if let n = pr["name"] as? String, Profiles.names().contains(n) { profile = n } // only profiles that exist: no paths
+            profileAmount = fin(pr["amount"])?.clamped(0...1) ?? 1
         }
         if let c = o["curve"] as? [String: Any] {
             curves = CHANNELS.enumerated().map { i, ch in
-                guard let a = c[ch] as? [[Double]], a.count >= 2 else { return curves[i] }
-                return a.map { CGPoint(x: $0[0], y: $0[1]) }
+                guard let a = c[ch] as? [Any] else { return curves[i] }
+                // curves keep full double precision, like the model (Float here would change them on every save)
+                let pts = a.compactMap { $0 as? [Any] }.filter { $0.count == 2 }.compactMap { p -> CGPoint? in
+                    guard let x = (p[0] as? NSNumber)?.doubleValue, let y = (p[1] as? NSNumber)?.doubleValue else { return nil }
+                    return CGPoint(x: x, y: y)
+                }
+                return cleanCurve(pts) ?? curves[i]
             }
         }
         guard whole else { return self }
         if let a = o["masks"] as? [[String: Any]] { masks = Array(a.compactMap(Mask.from).prefix(MAX_MASKS)) }
-        if let a = o["retouch"] as? [[Double]] {
-            retouch = a.filter { $0.count == 6 }.map { Spot(dx: Float($0[0]), dy: Float($0[1]), sx: Float($0[2]), sy: Float($0[3]), r: Float($0[4]), heal: $0[5] > 0.5) }
+        if let a = o["retouch"] as? [Any] {
+            retouch = a.compactMap { floats($0) }.filter { $0.count == 6 }.prefix(MAX_SPOTS).map {
+                Spot(dx: $0[0].clamped(0...1), dy: $0[1].clamped(0...1), sx: $0[2].clamped(0...1), sy: $0[3].clamped(0...1), r: $0[4].clamped(0.001...0.2), heal: $0[5] > 0.5)
+            }
         }
         if let g = o["geometry"] as? [String: Any] {
-            for k in ["straighten", "vertical", "horizontal"] { if let x = g[k] as? Double { self[k] = Float(x) } }
-            if let c = g["crop"] as? [Double], c.count == 4 { crop = CGRect(x: c[0], y: c[1], width: c[2] - c[0], height: c[3] - c[1]) }
-            rot90 = g["rot90"] as? Int ?? rot90
+            for k in ["straighten", "vertical", "horizontal"] { if let x = fin(g[k]) { self[k] = x.clamped(-1...1) } }
+            // crop in doubles, like the model: no rounding on every save
+            if let c = (g["crop"] as? [Any])?.compactMap({ ($0 as? NSNumber)?.doubleValue }).filter(\.isFinite), c.count == 4 {
+                let l = c[0].clamped(0...0.95), t = c[1].clamped(0...0.95)
+                crop = CGRect(x: l, y: t, width: c[2].clamped((l + 0.05)...1) - l, height: c[3].clamped((t + 0.05)...1) - t)
+            }
+            if let r = fin(g["rot90"]) { rot90 = ((Int(r) % 4) + 4) % 4 }
             flipH = g["flipH"] as? Bool ?? flipH
         }
         return self

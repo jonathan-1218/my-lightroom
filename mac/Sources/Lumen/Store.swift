@@ -4,6 +4,9 @@ import CoreGraphics
 import ImageIO
 import SQLite3
 import UniformTypeIdentifiers
+import CryptoKit
+
+func sha256(_ s: String) -> String { SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined() }
 
 struct Row: Equatable { var id: Int64; var edit: String; var rating: Int; var flag: Int; var label: String? }
 struct Preset: Identifiable, Equatable { var id: Int64; var name: String; var edit: String }
@@ -24,14 +27,33 @@ func schemaSQL() -> String {
 final class Db {
     private var db: OpaquePointer?
 
+    static let version = 1 // bump with a migrate_<n>.sql when schema.sql changes (same number as Android's SQLiteOpenHelper)
+
     init(path: String? = Db.defaultPath) {
-        sqlite3_open(path ?? ":memory:", &db)
-        exec("pragma foreign_keys = on")
-        let exists = query("select count(*) from sqlite_master where name = 'photos'") { $0.int(0) }.first ?? 0
-        if exists == 0 {
-            let sql = schemaSQL().split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("--") }.joined(separator: "\n")
-            for stmt in sql.split(separator: ";") where !stmt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { exec(String(stmt)) }
+        // serialized: one handle shared by the main thread and background work
+        guard sqlite3_open_v2(path ?? ":memory:", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
+            fatalError("Lumen can't open its database at \(path ?? "memory")")
         }
+        exec("pragma foreign_keys = on")
+        let v = query("pragma user_version") { $0.int(0) }.first ?? 0
+        let exists = (query("select count(*) from sqlite_master where name = 'photos'") { $0.int(0) }.first ?? 0) > 0
+        if v == 0 && !exists { // first run: the whole schema or nothing
+            let sql = schemaSQL().split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("--") }.joined(separator: "\n")
+            let statements = sql.split(separator: ";").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            guard !statements.isEmpty else { fatalError("schema.sql is missing from the app; rebuild with build.sh") }
+            let ok = tx { statements.allSatisfy { exec($0) } }
+            guard ok else { fatalError("Lumen couldn't create its database") }
+        }
+        if v == 0 { exec("pragma user_version = \(Db.version)") }
+    }
+
+    /// All-or-nothing: on failure nothing is written. Batch work also runs much faster inside one.
+    @discardableResult
+    func tx(_ body: () -> Bool) -> Bool {
+        exec("begin immediate")
+        let ok = body()
+        exec(ok ? "commit" : "rollback")
+        return ok
     }
 
     static var defaultPath: String {
@@ -52,7 +74,9 @@ final class Db {
         guard sqlite3_prepare_v2(db, sql, -1, &s, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(s) }
         bind(s!, args)
-        return sqlite3_step(s) == SQLITE_DONE
+        let ok = sqlite3_step(s) == SQLITE_DONE
+        if !ok { FileHandle.standardError.write(Data("Lumen db: \(String(cString: sqlite3_errmsg(db)))\n".utf8)) } // reason only, no user data
+        return ok
     }
 
     func query<T>(_ sql: String, _ args: [Any?] = [], _ row: (Cursor) -> T) -> [T] {
@@ -83,14 +107,21 @@ final class Db {
 
     /// The photo's row, created on first open.
     func open(key: String, uri: String, w: Int, h: Int) -> Row {
-        exec("insert into photos (key, uri, added_at, updated_at, width, height) values (?,?,?,?,?,?) on conflict (key) do update set uri = excluded.uri",
-             [key, uri, now, now, max(1, w), max(1, h)])
+        // Same file under a new key (its size changed, e.g. another app rewrote the metadata): keep its edits.
+        if query("select 1 from photos where key = ?", [key], { $0.int(0) }).isEmpty {
+            exec("update photos set key = ? where uri = ? and not exists (select 1 from photos where key = ?)", [key, uri, key])
+        }
+        exec("""
+            insert into photos (key, uri, added_at, updated_at, width, height) values (?,?,?,?,?,?) on conflict (key) do update set uri = excluded.uri,
+            width = case when excluded.width > 1 then excluded.width else width end, height = case when excluded.height > 1 then excluded.height else height end
+            """, [key, uri, now, now, max(1, w), max(1, h)])
         return query("select id, edit, rating, flag, label from photos where key = ?", [key]) {
             Row(id: $0.int(0), edit: $0.text(1) ?? "{\"v\":1}", rating: Int($0.int(2)), flag: Int($0.int(3)), label: $0.text(4))
         }.first!
     }
 
-    func saveEdit(_ id: Int64, _ edit: String) { exec("update photos set edit = ?, updated_at = ? where id = ?", [edit, now, id]) }
+    @discardableResult
+    func saveEdit(_ id: Int64, _ edit: String) -> Bool { exec("update photos set edit = ?, updated_at = ? where id = ?", [edit, now, id]) }
 
     /// rating 0...5, flag -1/0/1, label colour or nil. The schema's check constraints reject anything else.
     @discardableResult
@@ -108,7 +139,7 @@ final class Db {
 
     func editOf(_ id: Int64) -> String { query("select edit from photos where id = ?", [id]) { $0.text(0) ?? "{\"v\":1}" }.first ?? "{\"v\":1}" }
 
-    func presets() -> [Preset] { query("select id, name, edit from presets order by created_at, name") { Preset(id: $0.int(0), name: $0.text(1)!, edit: $0.text(2)!) } }
+    func presets() -> [Preset] { query("select id, name, edit from presets order by created_at, name, id") { Preset(id: $0.int(0), name: $0.text(1)!, edit: $0.text(2)!) } }
     func savePreset(_ name: String, _ edit: String) {
         exec("insert into presets (name, edit, created_at, updated_at) values (?,?,?,?) on conflict (name) do update set edit = excluded.edit, updated_at = excluded.updated_at",
              [name, edit, now, now])
@@ -116,7 +147,7 @@ final class Db {
     func deletePreset(_ id: Int64) { exec("delete from presets where id = ?", [id]) }
 
     func versions(_ photo: Int64) -> [Version] {
-        query("select id, name, edit from versions where photo_id = ? order by created_at", [photo]) { Version(id: $0.int(0), name: $0.text(1)!, edit: $0.text(2)!) }
+        query("select id, name, edit from versions where photo_id = ? order by created_at, id", [photo]) { Version(id: $0.int(0), name: $0.text(1)!, edit: $0.text(2)!) }
     }
     func saveVersion(_ photo: Int64, _ name: String, _ edit: String) { exec("insert into versions (photo_id, name, edit, created_at) values (?,?,?,?)", [photo, name, edit, now]) }
     func deleteVersion(_ id: Int64) { exec("delete from versions where id = ?", [id]) }
@@ -143,7 +174,7 @@ struct Photo: Identifiable, Hashable {
     let url: URL
     let key: String
     let date: Date
-    var id: String { key }
+    var id: String { url.path } // two different files can share a key (same name and size): both still show
 }
 
 let imageTypes: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2",
@@ -151,14 +182,14 @@ let imageTypes: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "tif", "tif
 
 /// Every photo under the folders, newest first.
 func scan(_ folders: [URL]) -> [Photo] {
-    var out = [Photo](), seen = Set<String>()
+    var out = [Photo](), seen = Set<String>() // file paths
     let keys: [URLResourceKey] = [.fileSizeKey, .creationDateKey, .contentModificationDateKey, .isRegularFileKey]
     for folder in folders {
         guard let it = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
         for case let url as URL in it where imageTypes.contains(url.pathExtension.lowercased()) {
             let v = try? url.resourceValues(forKeys: Set(keys))
             let key = "\(url.lastPathComponent)|\(v?.fileSize ?? 0)"
-            if seen.insert(key).inserted { out.append(Photo(url: url, key: key, date: v?.creationDate ?? v?.contentModificationDate ?? .distantPast)) }
+            if seen.insert(url.standardizedFileURL.path).inserted { out.append(Photo(url: url, key: key, date: v?.creationDate ?? v?.contentModificationDate ?? .distantPast)) }
         }
     }
     return out.sorted { $0.date > $1.date }
@@ -173,12 +204,12 @@ enum Thumbs {
         return d
     }()
 
-    static func get(_ p: Photo, edit: String?, at: Int64) -> CGImage? {
-        let key = "\(p.key)|\(edit == nil ? 0 : at)" as NSString
+    static func get(_ p: Photo, edit: String?) -> CGImage? {
+        let key = "\(p.url.path)|\(edit.map(sha256) ?? "")" as NSString // keyed by file + edit: a rating change doesn't re-render
         if let c = cache.object(forKey: key) { return c }
         var img: CGImage?
         if let edit {
-            let file = dir.appendingPathComponent("\(abs(key.hash)).jpg")
+            let file = dir.appendingPathComponent("\(sha256(key as String)).jpg")
             if let s = CGImageSourceCreateWithURL(file as CFURL, nil) { img = CGImageSourceCreateImageAtIndex(s, 0, nil) }
             if img == nil, let src = decode(p.url, maxPixel: 600) {
                 var e = Edit(); e.merge(edit)
@@ -207,8 +238,10 @@ struct ExportOptions: Codable, Equatable {
     var folder = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask)[0].appendingPathComponent("Lumen").path
 
     static var saved: ExportOptions {
-        get { (UserDefaults.standard.data(forKey: "export")).flatMap { try? JSONDecoder().decode(ExportOptions.self, from: $0) } ?? ExportOptions() }
-        set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: "export") }
+        get { var o = (UserDefaults.standard.data(forKey: "export")).flatMap { try? JSONDecoder().decode(ExportOptions.self, from: $0) } ?? ExportOptions()
+            o.location = false; return o }
+        set { var o = newValue; o.location = false // GPS goes out only when asked for this export, never by default later
+            UserDefaults.standard.set(try? JSONEncoder().encode(o), forKey: "export") }
     }
 }
 
@@ -231,8 +264,12 @@ private func watermark(_ cg: CGImage, _ text: String) -> CGImage {
 
 /// Renders `e` on the original file at the requested size and writes it to the export folder. Returns the file, or nil.
 func exportPhoto(_ url: URL, _ e: Edit, _ o: ExportOptions) -> (URL, Int, Int)? {
-    guard let full = decode(url) else { return nil }
-    var img = Look(full).render(e, maxLong: Double(o.long))
+    // requested size first, 4096 px if the full image can't be decoded or rendered (memory), as on Android
+    let attempts = o.long > 0 ? [o.long] : [0, 4096]
+    guard var img = attempts.lazy.compactMap({ long -> CGImage? in
+        guard let src = decode(url, maxPixel: long == 0 ? 0 : max(long, 4096)) else { return nil }
+        return Look(src).renderOrNil(e, maxLong: Double(long))
+    }).first else { return nil }
     img = watermark(img, o.watermark)
     let (type, ext): (UTType, String) = switch o.format {
         case "PNG": (.png, "png")
@@ -260,5 +297,6 @@ func exportPhoto(_ url: URL, _ e: Edit, _ o: ExportOptions) -> (URL, Int, Int)? 
     }
     props[kCGImagePropertyOrientation] = 1 // orientation is baked into the pixels
     CGImageDestinationAddImage(dest, img, props as CFDictionary)
-    return CGImageDestinationFinalize(dest) ? (out, img.width, img.height) : nil
+    guard CGImageDestinationFinalize(dest) else { try? FileManager.default.removeItem(at: out); return nil } // no half-written file
+    return (out, img.width, img.height)
 }

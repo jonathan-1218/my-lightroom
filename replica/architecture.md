@@ -28,7 +28,8 @@ The edit document (stored in `photos.edit`, `versions.edit`, `presets.edit`):
   "light":  { "exposure": 0, "contrast": 0, "highlights": 0, "shadows": 0, "whites": 0, "blacks": 0 },
   "curve":  { "rgb": [[0,0],[1,1]], "r": [], "g": [], "b": [] },
   "color":  { "temp": 0, "tint": 0, "vibrance": 0, "saturation": 0,
-              "grading": { "shadows": [0,0,0], "mid": [0,0,0], "high": [0,0,0], "blend": 0.5 } },
+              },
+  "grading": { "shadowHue": 0, "shadowSat": 0, "shadowLum": 0, "midHue": 0, "...": "mid*/high* the same", "blending": 0, "balance": 0 },
   "mixer":  { "redHue": 0, "redSat": 0, "redLum": 0, "...": "8 hues × Hue/Sat/Lum, flat keys" },
   "effects":{ "texture": 0, "clarity": 0, "dehaze": 0, "vignette": 0, "grain": 0, "grainSize": 0 },
   "detail": { "sharpen": 0, "noise": 0, "colorNoise": 0 },
@@ -101,3 +102,10 @@ One shader pass per frame. It samples source coordinates through geometry, then 
 4. **Could-haves**: AI subject/sky masks (ML Kit, adds ~5–10 MB: ask first), content-aware remove, Upright,
    lens profiles, Ultra HDR, watermark, proprietary RAW.
 5. **Fixes from replica-entrepreneur**: not run. The angle so far is "Lightroom's editor, offline, free, no account, under 1 MB".
+
+## Validation (added after the security review)
+
+Everything read back as an edit (database rows, presets, paste, imported .xmp) goes through `merge`, which keeps only
+finite numbers, clamps every value to its slider range, takes `rot90` mod 4, keeps the crop inside the photo, caps curves at
+64 points, brush masks at 20 000 points, spots at 500, accepts only known mask types and profile names, and ignores
+anything that isn't JSON. Imported presets are capped at 64 KB. Both apps apply the same rules (Develop.kt, Model.swift).

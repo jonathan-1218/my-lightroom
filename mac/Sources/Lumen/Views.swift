@@ -111,7 +111,7 @@ struct LibraryView: View {
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 4)], spacing: 4) {
                         ForEach(shown) { p in
-                            Thumb(p: p, row: m.rows[p.key], edited: m.isEdited(p.key), at: m.updated[p.key] ?? 0, selected: m.selection.contains(p.key))
+                            Thumb(p: p, row: m.rows[p.key], edited: m.isEdited(p.key), selected: m.selection.contains(p.key))
                                 .onTapGesture(count: 2) { m.open(p) }
                                 .onTapGesture {
                                     let mods = NSEvent.modifierFlags
@@ -159,7 +159,7 @@ struct LibraryView: View {
 }
 
 struct Thumb: View {
-    let p: Photo; let row: Row?; let edited: Bool; let at: Int64; let selected: Bool
+    let p: Photo; let row: Row?; let edited: Bool; let selected: Bool
     @State private var img: CGImage?
 
     var body: some View {
@@ -177,9 +177,9 @@ struct Thumb: View {
         .overlay { if selected { Rectangle().strokeBorder(accent, lineWidth: 3) } }
         .contentShape(Rectangle())
         .accessibilityElement().accessibilityLabel(p.url.lastPathComponent + (row.map { $0.rating > 0 ? ", \($0.rating) stars" : "" } ?? "") + (edited ? ", edited" : ""))
-        .task(id: "\(p.key)|\(edited ? at : 0)") {
+        .task(id: "\(p.id)|\(edited ? row?.edit ?? "" : "")") {
             let e = edited ? row?.edit : nil
-            img = await Task.detached(priority: .utility) { Thumbs.get(p, edit: e, at: at) }.value
+            img = await Task.detached(priority: .utility) { Thumbs.get(p, edit: e) }.value
         }
     }
 }
@@ -349,6 +349,7 @@ struct PhotoCanvas: View {
             let mk = m.edit.masks[m.selMask], g = mk.g.map(Double.init)
             switch mk.type {
             case "brush":
+                guard mk.strokes.reduce(0, { $0 + $1.pts.count }) < MAX_MASK_POINTS * 2 else { part = -2; return m.say("This mask is full: add another") }
                 once(); m.edit.masks[m.selMask].strokes.append(Stroke(pts: [Float(u), Float(v)], size: m.brushSize, erase: m.erase)); part = 9
             case "color":
                 part = -2
@@ -387,6 +388,10 @@ struct PhotoCanvas: View {
             let i = m.selMask
             guard m.edit.masks.indices.contains(i) else { return }
             if m.edit.masks[i].type == "brush" {
+                guard let last = m.edit.masks[i].strokes.last?.pts, last.count >= 2 else { return }
+                // keep a point only when the pointer has really moved, and stop at the cap: the edit stays small
+                guard hypot(Float(u) - last[last.count - 2], Float(v) - last[last.count - 1]) >= 0.002,
+                      m.edit.masks[i].strokes.reduce(0, { $0 + $1.pts.count }) < MAX_MASK_POINTS * 2 else { return }
                 m.edit.masks[i].strokes[m.edit.masks[i].strokes.count - 1].pts += [Float(u), Float(v)]
                 return
             }
