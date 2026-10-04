@@ -1,0 +1,12 @@
+<!-- The Lumen mark (logo/mark.svg) in the adaptive-icon safe zone: 100-unit mark scaled to 72 dp, centred on 108 dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <group android:translateX="18" android:translateY="18" android:scaleX="0.72" android:scaleY="0.72">
+        <group>
+            <clip-path android:pathData="M0,18h100v32h-100z M0,53h100v4h-100z M0,60.5h100v3.5h-100z" />
+            <path android:fillColor="#E3B45F" android:pathData="M25,44a25,25 0 1,0 50,0a25,25 0 1,0 -50,0z" />
+        </group>
+        <path android:fillColor="#8A8A8A" android:pathData="M21.75,74h56.5a1.75,1.75 0 0,1 0,3.5h-56.5a1.75,1.75 0 0,1 0,-3.5z" />
+        <path android:fillColor="#E3B45F" android:pathData="M55.5,75.75a6.5,6.5 0 1,0 13,0a6.5,6.5 0 1,0 -13,0z" />
+    </group>
+</vector>
