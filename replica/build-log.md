@@ -28,3 +28,9 @@ masks saved and restored, heal spot + clone with dragged source, export dialog (
 Share opens the system sheet. Self-test: 17 checks, PASS.
 Known slow spot: adding/moving a spot re-blurs the preview (~2 s on the emulator GPU); fine on a phone, worth caching if it isn't.
 Not exercised on device: luminance mask, mask invert (self-test only), brush erase.
+| Milestone 4: everything else | 2026-10-04 | done | AI masks, proprietary RAW, HDR, lens profiles (each needs a big dependency or a database; skipped on purpose) | auto level by gradient-angle histogram was 4° off on clean lines, replaced by a projection search; noise taps of 1.5 × (2048/size) pixels sampled the pixel itself on small images, floored at 1 px; Auto aimed the median at 45% and blew out a mostly-black photo, now aims the mean and caps at ±1.2 EV |
+
+Milestone 4 checked on the emulator: library filters (3★, album), long-press multi-select, batch preset (thumbnails re-render edited), batch album,
+Auto + histogram, profile chips, .cube import → applied, .xmp import → preset with exactly its 4 settings, keystone, grain, distortion.
+Release build (R8): 224 KB APK, self-test 27/27 PASS, library + editor open without crashes.
+Self-test only (not driven by hand): colour grading, noise reduction, auto level, find spots, perspective fit, versions DB, watermark.

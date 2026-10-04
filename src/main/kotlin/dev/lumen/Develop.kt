@@ -30,9 +30,12 @@ val SECTIONS = linkedMapOf(
     "light" to listOf("exposure", "contrast", "highlights", "shadows", "whites", "blacks"),
     "color" to listOf("temp", "tint", "vibrance", "saturation"),
     "mixer" to HUES.flatMap { listOf("${it}Hue", "${it}Sat", "${it}Lum") },
-    "effects" to listOf("texture", "clarity", "dehaze", "vignette"),
-    "detail" to listOf("sharpen"),
-    "geometry" to listOf("straighten"), // ±1 = ±45°
+    "grading" to listOf("shadowHue", "shadowSat", "shadowLum", "midHue", "midSat", "midLum",
+        "highHue", "highSat", "highLum", "blending", "balance"), // hue and sat are 0..1, the rest -1..1
+    "effects" to listOf("texture", "clarity", "dehaze", "vignette", "grain", "grainSize"),
+    "detail" to listOf("sharpen", "noise", "colorNoise"),
+    "optics" to listOf("distortion", "chroma", "lensVignette"),
+    "geometry" to listOf("straighten", "vertical", "horizontal"), // straighten ±1 = ±45°
 )
 val SLIDERS = SECTIONS.values.flatten()
 private val IDX = SLIDERS.withIndex().associate { it.value to it.index }
@@ -93,13 +96,15 @@ class Edit {
     var flipH = false
     var masks: List<Mask> = emptyList()
     var retouch: List<Spot> = emptyList()
+    var profile = "Color"     // "Color" = no profile; otherwise a built-in or imported LUT (Profiles)
+    var profileAmount = 1f
 
     operator fun get(n: String) = v[IDX.getValue(n)]
     operator fun set(n: String, x: Float) { v[IDX.getValue(n)] = x }
 
     fun copy() = Edit().also { e ->
         v.copyInto(e.v); e.curves = curves; e.crop = RectF(crop); e.rot90 = rot90; e.flipH = flipH
-        e.masks = masks.map { it.copy() }; e.retouch = retouch
+        e.masks = masks.map { it.copy() }; e.retouch = retouch; e.profile = profile; e.profileAmount = profileAmount
     }
 
     /** `whole = false`: just the look (presets, copy/paste) — no crop, masks or spots, which belong to one photo. */
@@ -107,12 +112,14 @@ class Edit {
         SECTIONS.forEach { (s, names) ->
             if (s != "geometry") put(s, JSONObject().apply { names.forEach { put(it, this@Edit[it].toDouble()) } })
         }
+        put("profile", JSONObject().put("name", profile).put("amount", profileAmount.toDouble()))
         put("curve", JSONObject().apply {
             CHANNELS.forEachIndexed { i, ch -> put(ch, JSONArray(curves[i].map { (x, y) -> JSONArray(listOf(x.toDouble(), y.toDouble())) })) }
         })
         if (whole) {
             put("geometry", JSONObject()
                 .put("straighten", this@Edit["straighten"].toDouble())
+                .put("vertical", this@Edit["vertical"].toDouble()).put("horizontal", this@Edit["horizontal"].toDouble())
                 .put("crop", JSONArray(listOf(crop.left, crop.top, crop.right, crop.bottom).map { it.toDouble() }))
                 .put("rot90", rot90).put("flipH", flipH))
             put("masks", JSONArray(masks.map { it.json() }))
@@ -128,6 +135,7 @@ class Edit {
             val sec = o.optJSONObject(s) ?: return@forEach
             names.forEach { if (sec.has(it)) set(it, sec.getDouble(it).toFloat()) }
         }
+        o.optJSONObject("profile")?.let { pr -> profile = pr.optString("name", profile); profileAmount = pr.optDouble("amount", 1.0).toFloat() }
         o.optJSONObject("curve")?.let { c ->
             curves = CHANNELS.mapIndexed { i, ch ->
                 c.optJSONArray(ch)?.let { a -> (0 until a.length()).map { a.getJSONArray(it).let { p -> p.getDouble(0).toFloat() to p.getDouble(1).toFloat() } } }
@@ -142,7 +150,7 @@ class Edit {
             }
         }
         if (whole && g != null) {
-            if (g.has("straighten")) set("straighten", g.getDouble("straighten").toFloat())
+            listOf("straighten", "vertical", "horizontal").forEach { if (g.has(it)) set(it, g.getDouble(it).toFloat()) }
             g.optJSONArray("crop")?.let { crop = RectF(it.getDouble(0).toFloat(), it.getDouble(1).toFloat(), it.getDouble(2).toFloat(), it.getDouble(3).toFloat()) }
             rot90 = g.optInt("rot90", rot90)
             flipH = g.optBoolean("flipH", flipH)
@@ -154,6 +162,20 @@ class Edit {
     fun oriented(w: Int, h: Int) = if (rot90 % 2 == 1) h to w else w to h
     fun degrees() = get("straighten") * 45f
 
+    /** Oriented frame → straightened frame: perspective (keystone) first, then the straighten rotation. */
+    fun shape(ow: Int, oh: Int): Matrix {
+        val kv = 0.25f * get("vertical"); val kh = 0.25f * get("horizontal")
+        val w = ow.toFloat(); val h = oh.toFloat()
+        // vertical > 0 widens the top (fixes buildings leaning back); horizontal > 0 widens the left
+        val dst = floatArrayOf(
+            -maxOf(kv, 0f) * w / 2, -maxOf(kh, 0f) * h / 2,      w + maxOf(kv, 0f) * w / 2, -maxOf(-kh, 0f) * h / 2,
+            w + maxOf(-kv, 0f) * w / 2, h + maxOf(-kh, 0f) * h / 2, -maxOf(-kv, 0f) * w / 2, h + maxOf(kh, 0f) * h / 2)
+        return Matrix().apply {
+            setPolyToPoly(floatArrayOf(0f, 0f, w, 0f, w, h, 0f, h), 0, dst, 0, 4)
+            postRotate(degrees(), w / 2, h / 2)
+        }
+    }
+
     /** Source pixels → output pixels. Without crop: the whole straightened image (crop mode). */
     fun matrix(w: Int, h: Int, withCrop: Boolean = true): Matrix {
         val (ow, oh) = oriented(w, h)
@@ -161,7 +183,7 @@ class Edit {
             setRotate(90f * rot90, w / 2f, h / 2f)
             postTranslate((ow - w) / 2f, (oh - h) / 2f)
             if (flipH) postScale(-1f, 1f, ow / 2f, oh / 2f)
-            postRotate(degrees(), ow / 2f, oh / 2f)
+            postConcat(shape(ow, oh))
             if (withCrop) postTranslate(-crop.left * ow, -crop.top * oh)
         }
     }
@@ -171,10 +193,10 @@ class Edit {
         return (crop.width() * ow).roundToInt().coerceAtLeast(1) to (crop.height() * oh).roundToInt().coerceAtLeast(1)
     }
 
-    /** Is this crop (normalised, in an ow×oh oriented frame) fully inside the straightened photo? */
+    /** Is this crop (normalised, in an ow×oh oriented frame) fully inside the straightened, keystoned photo? */
     fun fits(r: RectF, ow: Int, oh: Int): Boolean {
         val pts = floatArrayOf(r.left * ow, r.top * oh, r.right * ow, r.top * oh, r.right * ow, r.bottom * oh, r.left * ow, r.bottom * oh)
-        Matrix().apply { setRotate(-degrees(), ow / 2f, oh / 2f) }.mapPoints(pts)
+        Matrix().apply { shape(ow, oh).invert(this) }.mapPoints(pts)
         val e = 1e-3f * maxOf(ow, oh)
         return (pts.indices step 2).all { pts[it] in -e..ow + e && pts[it + 1] in -e..oh + e }
     }
@@ -246,17 +268,24 @@ private fun lut(curves: List<List<Pair<Float, Float>>>): Bitmap {
 
 // ---- the shader: one GPU pass, preview and export ----
 
+private val NR_TAPS = listOf(1f to 0f, -1f to 0f, 0f to 1f, 0f to -1f, 0.7f to 0.7f, -0.7f to 0.7f, 0.7f to -0.7f, -0.7f to -0.7f)
+
 private val AGSL = """
 uniform shader img;
 uniform shader blurS;
 uniform shader blurL;
 uniform shader lut;
+uniform shader lut3d;
 uniform float3x3 toOut;
 ${SCALARS.joinToString("\n") { "uniform float u_$it;" }}
 uniform float4 hueA; uniform float4 hueB;
 uniform float4 satA; uniform float4 satB;
 uniform float4 lumA; uniform float4 lumB;
 uniform float2 srcSize;
+uniform float pxScale;     // source long edge / 2048: neighbourhood radii scale with resolution
+uniform float outAspect;   // output width / height
+uniform float lutN;        // 3D LUT size, 0 = no profile
+uniform float profileAmt;
 uniform float showMask;
 uniform float3 overlayRgb;
 ${(0 until MAX_MASKS).joinToString("\n") { "uniform shader mk$it; uniform float4 mg$it; uniform float4 mx$it; uniform float4 ma$it; uniform float4 mb$it;" }}
@@ -315,22 +344,66 @@ float3 local(float3 x, float4 a, float4 b, float w, float dL) {
     L = dot(x, W);
     return mix(float3(L), x, 1.0 + b.z * w);
 }
-
 float3 curve(float3 x) {
     x = clamp(x, 0.0, 1.0) * 255.0 + 0.5;
     return float3(lut.eval(float2(x.r, 0.5)).r, lut.eval(float2(x.g, 0.5)).g, lut.eval(float2(x.b, 0.5)).b);
 }
+// 3D LUT stored as N slices of N×N side by side (blue picks the slice); linear filtering does red and green.
+float3 lut3(float3 c) {
+    float n = lutN;
+    float3 s = clamp(c, 0.0, 1.0) * (n - 1.0);
+    float b0 = floor(s.b);
+    float b1 = min(b0 + 1.0, n - 1.0);
+    float2 xy = float2(s.r + 0.5, s.g + 0.5);
+    return mix(float3(lut3d.eval(xy + float2(b0 * n, 0.0)).rgb), float3(lut3d.eval(xy + float2(b1 * n, 0.0)).rgb), s.b - b0);
+}
+// Colour grading: tint by luminance range. h/s 0..1, l -1..1.
+float3 gradeRange(float3 x, float h, float s, float l, float w) {
+    if (w <= 0.0) return x;
+    float3 t = rgb(float3(h, 1.0, 1.0));
+    t /= max(dot(t, W), 1e-3);
+    x = mix(x, x * t, 0.5 * s * w);
+    return x * (1.0 + 0.5 * l * w);
+}
+float hash(float2 p) { return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
+float vnoise(float2 g) {
+    float2 i = floor(g);
+    float2 f = fract(g);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + float2(1.0, 0.0)), f.x), mix(hash(i + float2(0.0, 1.0)), hash(i + float2(1.0, 1.0)), f.x), f.y);
+}
 
-half4 main(float2 p) {
+half4 main(float2 p0) {
+    // Lens distortion: resample around the centre. Pincushion (k > 0) is scaled so the corners stay inside.
+    float2 ctr = srcSize * 0.5;
+    float2 dd = p0 - ctr;
+    float r2 = dot(dd, dd) / dot(ctr, ctr);
+    float k = 0.3 * u_distortion;
+    float2 p = ctr + dd * (1.0 + k * r2) / (1.0 + max(k, 0.0));
+
     half4 c = img.eval(p);
     float3 x = float3(c.rgb);
+    if (u_chroma != 0.0) { // lateral chromatic aberration: red and blue planes scaled against green
+        x.r = float(img.eval(ctr + (p - ctr) * (1.0 + 0.003 * u_chroma)).r);
+        x.b = float(img.eval(ctr + (p - ctr) * (1.0 - 0.003 * u_chroma)).b);
+    }
+    float3 bs = float3(blurS.eval(p).rgb);
+    float3 bl = float3(blurL.eval(p).rgb);
+    if (u_noise > 0.0) { // edge-preserving: neighbours count only when their brightness is close
+        float L0 = dot(x, W);
+        float sig = 0.01 + 0.08 * u_noise;
+        float3 acc = x;
+        float wsum = 1.0;
+${NR_TAPS.joinToString("\n") { (dx, dy) -> """        { float3 sn = float3(img.eval(p + float2($dx, $dy) * 1.5 * pxScale).rgb); float dn = dot(sn, W) - L0; float wn = exp(-dn * dn / (sig * sig)); acc += sn * wn; wsum += wn; }""" }}
+        x = mix(x, acc / wsum, u_noise);
+    }
+    if (u_colorNoise > 0.0) x = mix(x, bs - dot(bs, W) + dot(x, W), u_colorNoise); // keep brightness, take the local average colour
     if (u_sharpen > 0.0) {
         float3 n = float3(img.eval(p + float2(1.0, 0.0)).rgb + img.eval(p - float2(1.0, 0.0)).rgb
                         + img.eval(p + float2(0.0, 1.0)).rgb + img.eval(p - float2(0.0, 1.0)).rgb) * 0.25;
         x += 1.5 * u_sharpen * (x - n);
     }
-    float3 bs = float3(blurS.eval(p).rgb);
-    float3 bl = float3(blurL.eval(p).rgb);
+    x *= 1.0 + 0.6 * u_lensVignette * r2; // lens vignetting: brighten (or darken) towards the corners
     float dS = dot(x, W) - dot(bs, W);
     float dL = dot(x, W) - dot(bl, W);
 
@@ -365,6 +438,8 @@ ${(0 until MAX_MASKS).joinToString("\n") { i -> """
     else if (mx$i.x == 5.0) w$i = lumaW(mg$i, mx$i.y, oL);
     if (mx$i.x > 0.0 && mx$i.z > 0.5) w$i = 1.0 - w$i;
     x = local(x, ma$i, mb$i, w$i, dL);""" }}
+
+    if (lutN > 0.0) x = mix(x, lut3(x), profileAmt);
     x = curve(x);
 
     L = dot(x, W);
@@ -379,11 +454,26 @@ ${(0 until MAX_MASKS).joinToString("\n") { i -> """
     x = mix(float3(dot(x, W)), x, 1.0 + band(satA, satB, deg)); // toward luminance, so -100 gives the right grey
     x *= 1.0 + 0.5 * band(lumA, lumB, deg) * chroma;
 
-    float2 q = (toOut * float3(p, 1.0)).xy; // 0..1 across the cropped output
+    L = clamp(dot(x, W), 0.0, 1.0);
+    float blend = 0.3 * (u_blending + 1.0) * 0.5;
+    float bal = 0.25 * u_balance;
+    float ws = 1.0 - smoothstep(0.0, 0.5 + bal + blend, L);
+    float wh = smoothstep(0.5 + bal - blend, 1.0, L);
+    x = gradeRange(x, u_shadowHue, u_shadowSat, u_shadowLum, ws);
+    x = gradeRange(x, u_midHue, u_midSat, u_midLum, clamp(1.0 - ws - wh, 0.0, 1.0));
+    x = gradeRange(x, u_highHue, u_highSat, u_highLum, wh);
+
+    float3 qh = toOut * float3(p0, 1.0);
+    float2 q = qh.xy / qh.z; // 0..1 across the cropped output (perspective-correct)
     x *= 1.0 + 0.8 * u_vignette * smoothstep(0.4, 1.1, length(q - 0.5) * 1.414);
+    if (u_grain > 0.0) {
+        float cells = 900.0 * exp2(-1.5 * u_grainSize);
+        float n = vnoise(q * float2(cells, cells / outAspect)) - 0.5;
+        x += u_grain * 0.3 * n * (0.3 + 0.7 * (1.0 - abs(2.0 * L - 1.0)));
+    }
     if (showMask >= 0.0) {
-        float ws = showMask == 0.0 ? w0 : (showMask == 1.0 ? w1 : (showMask == 2.0 ? w2 : w3));
-        x = mix(x, overlayRgb, 0.5 * ws);
+        float wsel = showMask == 0.0 ? w0 : (showMask == 1.0 ? w1 : (showMask == 2.0 ? w2 : w3));
+        x = mix(x, overlayRgb, 0.5 * wsel);
     }
     return half4(half3(clamp(x, 0.0, 1.0)), c.a);
 }
@@ -493,6 +583,9 @@ class Look(val base: Bitmap) {
     private val brushShader = arrayOfNulls<BitmapShader>(MAX_MASKS)
     private val none by lazy { shader(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.BLACK) }) }
     var overlay = floatArrayOf(1f, 0.3f, 0.3f) // mask overlay colour, set from the tokens by the view
+    private var profileFor: String? = null
+    private var profileShader: BitmapShader? = null
+    private var profileN = 0
 
     private fun shader(b: Bitmap) = BitmapShader(b, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply {
         filterMode = BitmapShader.FILTER_MODE_LINEAR
@@ -508,6 +601,12 @@ class Look(val base: Bitmap) {
         if (lutFor != e.curves) { // the LUT is sampled in its own 256×1 pixel space, never scaled to the photo
             lutShader = BitmapShader(lut(e.curves), Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply { filterMode = BitmapShader.FILTER_MODE_LINEAR }
             lutFor = e.curves
+        }
+        if (profileFor != e.profile) {
+            val b = Profiles.lut(e.profile)
+            profileShader = b?.let { BitmapShader(it, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply { filterMode = BitmapShader.FILTER_MODE_LINEAR } }
+            profileN = b?.height ?: 0
+            profileFor = e.profile
         }
         for (i in 0 until MAX_MASKS) {
             val m = e.masks.getOrNull(i)?.takeIf { it.type == "brush" }
@@ -536,6 +635,11 @@ class Look(val base: Bitmap) {
             fx.setFloatUniform("${u}B", x[4], x[5], x[6], x[7])
         }
         fx.setFloatUniform("srcSize", w.toFloat(), h.toFloat())
+        fx.setFloatUniform("pxScale", maxOf(1f, maxOf(w, h) / 2048f)) // never below one pixel, or small images sample themselves
+        fx.setFloatUniform("outAspect", ow.toFloat() / oh)
+        fx.setInputShader("lut3d", profileShader ?: none)
+        fx.setFloatUniform("lutN", profileN.toFloat())
+        fx.setFloatUniform("profileAmt", e.profileAmount)
         fx.setFloatUniform("showMask", showMask.toFloat())
         fx.setFloatUniform("overlayRgb", overlay[0], overlay[1], overlay[2])
         for (i in 0 until MAX_MASKS) {

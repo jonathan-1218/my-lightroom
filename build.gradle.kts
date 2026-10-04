@@ -10,4 +10,13 @@ android {
         versionCode = 1
         versionName = "1.0"
     }
+    buildTypes {
+        release {
+            isMinifyEnabled = true // R8: strips unused Kotlin stdlib, keeps the APK small
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            // ponytail: personal use, so release is signed with the local debug key; make a real keystore before sharing the APK
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
 }

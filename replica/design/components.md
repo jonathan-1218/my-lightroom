@@ -57,3 +57,13 @@ Retouch spots (EditView retouch mode)
 
 Export dialog
   parts     Format chips, Long edge chips, Quality slider (50–100, off for PNG), metadata switch (accent when on), Share / Cancel / Export in accent
+
+HistogramView
+  parts     red / green / blue at 40% (label-* colours), ends ignored when scaling
+  a11y      decorative, hidden from TalkBack
+
+Library selection
+  long press  selects; tap toggles while selecting; accent ring + dot on selected cells; title shows "N selected"
+  bar         Paste · Preset · Rate · Album · Export · Done (replaces Pick)
+  filters     chips under the title: All, Picks, 3★ +, Rejects, Edited, labels in use, albums
+  cells       "±" bottom right when edited; edited thumbnails are rendered with the edit

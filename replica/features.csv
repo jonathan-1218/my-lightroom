@@ -8,46 +8,46 @@ Exposure contrast highlights shadows whites blacks,light,must,yes,yes,
 Temp tint vibrance saturation,color,must,yes,yes,
 Tone curve (RGB + per channel),light,must,yes,yes,own Curve tab; monotone cubic so points never overshoot
 Color mixer (HSL per 8 hues),color,must,yes,yes,8 hue bands; saturation desaturates toward luminance
-Color grading (shadows/mid/highlights wheels),color,should,yes,no,
+Color grading (shadows/mid/highlights wheels),color,should,yes,yes,hue/sat/lum per range + blending + balance (sliders not wheels)
 Texture clarity dehaze,effects,must,yes,yes,blurs are normalised so preview and export match
 Vignette,effects,must,yes,yes,
-Grain,effects,should,yes,no,
+Grain,effects,should,yes,yes,size slider; lighter in deep shadows and highlights
 Sharpening,detail,must,yes,yes,4-tap unsharp in source pixels; preview at 2048px shows it softer than export
-Noise reduction (classic),detail,should,yes,no,bilateral shader; not AI Denoise
+Noise reduction (classic),detail,should,yes,yes,edge-preserving luminance + colour noise; not AI Denoise
 Crop with aspect presets,crop,must,yes,yes,Free / Original / 1:1 / 4:5 / 16:9 follow the frame orientation
 Straighten rotate flip,crop,must,yes,yes,crop auto-shrinks to stay inside the straightened photo
-Manual perspective (vertical/horizontal),geometry,should,yes,no,
-Guided / auto Upright,geometry,could,yes,no,line detection
-Manual lens distortion + chromatic aberration,optics,should,yes,no,
-Lens profile corrections,optics,could,yes,no,needs a lens database (lensfun data)
-Auto settings,light,should,yes,no,from histogram
-Histogram,edit,should,yes,no,
-Profiles (Color / Mono / creative LUTs),profiles,should,yes,no,.cube import as 3D LUT
-Presets: create apply import,presets,must,yes,partial,6 built-in + save/delete; no import of other apps' preset files
+Manual perspective (vertical/horizontal),geometry,should,yes,yes,keystone; outward stretch is clipped in crop view
+Guided / auto Upright,geometry,could,yes,partial,Level button straightens from the photo's lines; no vertical keystone auto
+Manual lens distortion + chromatic aberration,optics,should,yes,yes,distortion / lateral CA / lens vignetting
+Lens profile corrections,optics,could,yes,skip,needs a lens database per camera+lens; manual sliders cover it
+Auto settings,light,should,yes,yes,Auto in the Light tab from the brightness spread
+Histogram,edit,should,yes,yes,RGB, follows every edit
+Profiles (Color / Mono / creative LUTs),profiles,should,yes,yes,6 built-in + .cube import with an amount slider
+Presets: create apply import,presets,must,yes,yes,6 built-in + save/delete + import Lightroom/Camera Raw .xmp (keys Lumen has)
 Copy / paste edits,presets,must,yes,yes,copies everything except crop; lasts while the app process lives
-Batch apply to selected photos,presets,should,yes,no,
+Batch apply to selected photos,presets,should,yes,yes,long-press to select; paste / preset / rate / album / export
 Linear gradient mask,masking,should,yes,yes,
 Radial gradient mask,masking,should,yes,yes,feather slider
 Brush mask,masking,should,yes,yes,paint / erase / size / softness; strokes stored as vectors
 Color range / luminance range mask,masking,should,yes,yes,tap to pick a colour + range; luminance low/high/feather (luminance not exercised on device)
 Mask feather and edge sliders,masking,should,yes,partial,feather on radial / brush / luminance; no separate edge slider
-Select subject / sky / background (AI),masking,could,yes,no,needs ML Kit segmentation = a dependency; breaks 'light'
+Select subject / sky / background (AI),masking,could,yes,skip,needs ML Kit models (~5–10 MB); breaks 'light' — ask before adding
 Heal and clone brush,retouch,should,yes,partial,tap-placed circular spots with draggable source; no freeform heal strokes
-Content-aware remove,retouch,could,yes,no,PatchMatch on CPU
-Blemish / dust spot auto-remove,retouch,could,yes,no,
-Versions (named snapshots),library,should,yes,no,
+Content-aware remove,retouch,could,yes,partial,heal spots pick the best-matching nearby source automatically; no freeform fill
+Blemish / dust spot auto-remove,retouch,could,yes,yes,Find spots in the Retouch tab
+Versions (named snapshots),library,should,yes,yes,Presets tab
 Ratings flags color labels,library,must,yes,yes,editor Rate tab + 0-5/P/X/U keys; badges on library cells
-Albums,library,should,yes,no,
-Filter and search by rating/flag/date,library,should,yes,no,
+Albums,library,should,yes,yes,from the editor (Rate tab) or batch; album chips filter the library
+Filter and search by rating/flag/date,library,should,yes,partial,All / Picks / 3★+ / Rejects / Edited / labels / albums; no date search
 Export JPEG with quality and size,export,must,yes,yes,quality 50-100; long edge full/4096/2048/1080; settings remembered
-Export PNG / TIFF / original,export,should,yes,partial,JPEG PNG WebP; no TIFF or original-file export
-Keep EXIF on export,export,must,yes,partial,dates camera lens exposure copied; GPS dropped (needs ACCESS_MEDIA_LOCATION)
+Export PNG / TIFF / original,export,should,yes,partial,JPEG PNG WebP; no TIFF
+Keep EXIF on export,export,must,yes,yes,dates camera lens exposure; GPS when Keep location is on (asks for media-location permission)
 Full-resolution export beyond 4096px,export,must,yes,yes,2048px tiles; 6000x4000 source tested
-Watermark,export,could,yes,no,
+Watermark,export,could,yes,yes,text, bottom right, in the export dialog
 Share to other apps,export,should,yes,yes,Share in the export dialog hands the exported file to the system sheet
 DNG RAW,import,must,yes,partial,ImageDecoder decodes DNG; still untested (no sample on hand)
-Proprietary RAW (CR3 NEF ARW),import,could,yes,no,needs LibRaw native lib
-HDR editing and Ultra HDR export,hdr,could,yes,no,gainmap API 34+
+Proprietary RAW (CR3 NEF ARW),import,could,yes,skip,needs LibRaw native code (~2 MB per ABI); breaks 'light' — ask before adding
+HDR editing and Ultra HDR export,hdr,could,yes,skip,gain-map editing doubles the pipeline; SDR export only
 Lens blur (AI depth),effects,could,yes,skip,needs depth model
 Generative remove / expand / prompt to edit,ai,skip,yes,skip,cloud AI models; not an app feature you can rebuild offline
 Natural language search,ai,skip,yes,skip,cloud AI

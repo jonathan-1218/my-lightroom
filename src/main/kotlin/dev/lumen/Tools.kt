@@ -141,8 +141,9 @@ class EditView(ctx: Context, private val onStart: () -> Unit, private val onChan
         val l = look ?: return
         val w = l.src.width.toFloat(); val h = l.src.height.toFloat()
         val rx = spotSize * maxOf(w, h) / w; val ry = spotSize * maxOf(w, h) / h
-        val (sx, sy) = listOf(x + 2.5f * rx to y, x - 2.5f * rx to y, x to y + 2.5f * ry, x to y - 2.5f * ry)
-            .firstOrNull { (a, b) -> a - rx >= 0 && a + rx <= 1 && b - ry >= 0 && b + ry <= 1 } ?: return
+        val (sx, sy) = bestSource(l.src, x, y, spotSize) // the nearby patch whose surroundings match best
+            ?: listOf(x + 2.5f * rx to y, x - 2.5f * rx to y, x to y + 2.5f * ry, x to y - 2.5f * ry)
+                .firstOrNull { (a, b) -> a - rx >= 0 && a + rx <= 1 && b - ry >= 0 && b + ry <= 1 } ?: return
         if (x - rx < 0 || x + rx > 1 || y - ry < 0 || y + ry > 1) return
         onStart()
         edit.retouch = edit.retouch + Spot(x, y, sx, sy, spotSize, heal)
@@ -362,5 +363,30 @@ class CurveView(ctx: Context, private val edit: () -> Edit, private val onStart:
         if (!started) { started = true; onStart() } // one undo step per gesture
         edit().curves = edit().curves.toMutableList().also { it[channel] = pts }
         invalidate(); onChange()
+    }
+}
+
+/** RGB histogram of the edited photo, three translucent layers. */
+class HistogramView(ctx: Context) : View(ctx) {
+    var data: Array<IntArray>? = null; set(v) { field = v; invalidate() }
+    private val fills = listOf("label-red", "label-green", "label-blue").map { k ->
+        Paint(Paint.ANTI_ALIAS_FLAG).apply { color = (Ui.color(k) and 0x00FFFFFF) or 0x66000000 }
+    }
+    init { contentDescription = "Histogram"; importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
+
+    override fun onMeasure(w: Int, h: Int) = setMeasuredDimension(MeasureSpec.getSize(w), Ui.dp(64))
+
+    override fun onDraw(c: Canvas) {
+        val d = data ?: return
+        // ignore the two end bins when scaling, so a clipped sky doesn't flatten the rest
+        val top = d.maxOf { ch -> (1..254).maxOf { ch[it] } }.coerceAtLeast(1).toFloat()
+        val pad = Ui.space(4).toFloat(); val w = width - 2 * pad; val h = height.toFloat()
+        d.forEachIndexed { i, ch ->
+            c.drawPath(Path().apply {
+                moveTo(pad, h)
+                for (b in 0..255) lineTo(pad + b / 255f * w, h - (ch[b] / top).coerceAtMost(1f) * h)
+                lineTo(pad + w, h); close()
+            }, fills[i])
+        }
     }
 }

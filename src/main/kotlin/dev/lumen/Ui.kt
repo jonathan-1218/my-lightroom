@@ -67,6 +67,16 @@ fun Context.textButton(label: String, onClick: () -> Unit) = Ui.type(TextView(th
     setOnClickListener { onClick() }
 }
 
+/** On/off row: label left, accent switch right. */
+fun Context.toggle(label: String, checked: Boolean, onChange: (Boolean) -> Unit) = android.widget.Switch(this).apply {
+    text = label; isChecked = checked
+    Ui.type(this, "sm"); setPadding(Ui.space(4), Ui.space(2), Ui.space(4), 0); minHeight = Ui.size("touch")
+    val on = intArrayOf(android.R.attr.state_checked)
+    thumbTintList = ColorStateList(arrayOf(on, intArrayOf()), intArrayOf(Ui.color("accent"), Ui.color("text-muted")))
+    trackTintList = ColorStateList(arrayOf(on, intArrayOf()), intArrayOf(Ui.color("accent"), Ui.color("border")))
+    setOnCheckedChangeListener { _, c -> onChange(c) }
+}
+
 /** Panel tabs. Selected tab: accent pill. TalkBack reads "selected". */
 /** `initial` is selected (and reported) once at creation, so state the caller reads is never clobbered by chip 0. */
 class Tabs(ctx: Context, names: List<String>, initial: Int = 0, private val onSelect: (Int) -> Unit) : HorizontalScrollView(ctx) {
@@ -104,8 +114,14 @@ class Tabs(ctx: Context, names: List<String>, initial: Int = 0, private val onSe
 }
 
 /** Lightroom-style slider: name left, signed value right, -100..100, tap the name to reset. */
-class SliderRow(ctx: Context, name: String, onStart: () -> Unit = {}, onChange: (Int) -> Unit) : LinearLayout(ctx) {
-    private val title = name.replaceFirstChar { it.uppercase() }
+/** Slider labels: edit keys → words. Anything not listed is the key with a capital. */
+val TITLES = mapOf("grainSize" to "Grain size", "noise" to "Noise reduction", "colorNoise" to "Color noise", "chroma" to "Chromatic aberration",
+    "lensVignette" to "Lens vignetting", "temp" to "Temperature", "vertical" to "Vertical", "horizontal" to "Horizontal")
+fun title(key: String) = TITLES[key] ?: key.replaceFirstChar { it.uppercase() }
+
+class SliderRow(ctx: Context, name: String, onStart: () -> Unit = {}, private val format: (Int) -> String = { "%+d".format(it) },
+                onChange: (Int) -> Unit) : LinearLayout(ctx) {
+    private val title = title(name)
     private val value = Ui.type(TextView(ctx), "sm", "text-muted").apply { fontFeatureSettings = "tnum" }
     val bar = SeekBar(ctx).apply {
         min = -100; max = 100; progress = 0
@@ -131,7 +147,7 @@ class SliderRow(ctx: Context, name: String, onStart: () -> Unit = {}, onChange: 
         })
         addView(bar)
         fun show(p: Int) {
-            value.text = "%+d".format(p)
+            value.text = format(p)
             value.setTextColor(Ui.color(if (p == 0) "text-muted" else "text"))
             bar.stateDescription = value.text
         }

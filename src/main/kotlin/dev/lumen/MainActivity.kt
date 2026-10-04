@@ -34,13 +34,6 @@ import android.widget.TextView
 import android.widget.Toast
 import kotlin.math.abs
 
-private val EXIF_TAGS = listOf(
-    ExifInterface.TAG_DATETIME, ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_DATETIME_DIGITIZED, ExifInterface.TAG_OFFSET_TIME_ORIGINAL,
-    ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL, "LensMake", "LensModel", // framework ExifInterface has no constants for these
-    ExifInterface.TAG_F_NUMBER, ExifInterface.TAG_EXPOSURE_TIME, ExifInterface.TAG_ISO_SPEED_RATINGS,
-    ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, ExifInterface.TAG_FLASH,
-    ExifInterface.TAG_WHITE_BALANCE, ExifInterface.TAG_ARTIST, ExifInterface.TAG_COPYRIGHT,
-)
 private val LABELS = listOf(null, "red", "yellow", "green", "blue", "purple")
 
 /** Copied develop settings (no crop). ponytail: lives as long as the process; persist if copy-then-reopen matters */
@@ -71,6 +64,7 @@ class MainActivity : Activity() {
         super.onCreate(state)
         if (intent.getBooleanExtra("selftest", false)) return selfTest()
         Ui.init(this)
+        Profiles.init(this)
         if (intent.getBooleanExtra("design", false)) return setContentView(designGallery().apply { fitInsets() })
         view = EditView(this, ::checkpoint, ::changed).apply { contentDescription = "Photo. Touch and hold to see the original." }
 
@@ -87,8 +81,8 @@ class MainActivity : Activity() {
         }
 
         val panels = linkedMapOf(
-            "Presets" to presetsPanel(), "Crop" to cropPanel(), "Light" to sliders("light"), "Curve" to curvePanel(), "Color" to colorPanel(),
-            "Effects" to sliders("effects"), "Detail" to sliders("detail"), "Masks" to masksPanel(), "Retouch" to retouchPanel(),
+            "Presets" to presetsPanel(), "Crop" to cropPanel(), "Light" to lightPanel(), "Curve" to curvePanel(), "Color" to colorPanel(),
+            "Effects" to sliders("effects"), "Detail" to sliders("detail"), "Optics" to sliders("optics"), "Masks" to masksPanel(), "Retouch" to retouchPanel(),
             "Rate" to ratePanel())
         val host = FrameLayout(this).apply { panels.values.forEach { addView(it) } }
         val scroller = ScrollView(this).apply { addView(host) }
@@ -139,18 +133,39 @@ class MainActivity : Activity() {
 
     /** A slider bound to an edit key (the key can change, e.g. the colour mixer's selected hue). */
     /** A -100..100 slider bound to any value in the edit. `register` keeps it in step on load / undo / preset. */
-    private fun bound(title: String, get: () -> Float, set: (Float) -> Unit, register: Boolean = true, after: () -> Unit = {}) =
-        SliderRow(this, title, ::checkpoint) { p -> set(p / 100f); after(); changed() }
+    private fun bound(title: String, get: () -> Float, set: (Float) -> Unit, register: Boolean = true, format: (Int) -> String = { "%+d".format(it) },
+                      after: () -> Unit = {}) =
+        SliderRow(this, title, ::checkpoint, format) { p -> set(p / 100f); after(); changed() }
             .also { r -> r.bar.progress = Math.round(get() * 100); if (register) sync += { r.bar.progress = Math.round(get() * 100) } }
 
     private fun slider(title: String, key: () -> String, after: () -> Unit = {}) = bound(title, { edit[key()] }, { edit[key()] = it }, after = after)
 
     /** A slider for a 0..1 value (shown -100..100). */
-    private fun unit(title: String, get: () -> Float, set: (Float) -> Unit) = bound(title, { get() * 2 - 1 }, { set((it + 1) / 2) }, register = false)
+    private fun unit(title: String, get: () -> Float, set: (Float) -> Unit, register: Boolean = false, format: (Int) -> String = { "%+d".format(it) }) =
+        bound(title, { get() * 2 - 1 }, { set((it + 1) / 2) }, register, format)
+    private val degrees: (Int) -> String = { "${Math.round((it + 100) / 200f * 360)}°" }
+    private val percent: (Int) -> String = { "${(it + 100) / 2}" }
 
     private fun hint(s: String) = Ui.type(TextView(this), "sm", "text-muted").apply { text = s; setPadding(Ui.space(4), Ui.space(2), Ui.space(4), 0) }
 
     private fun sliders(section: String) = column(*SECTIONS.getValue(section).map { k -> slider(k, { k }) }.toTypedArray())
+
+    private lateinit var histogram: HistogramView
+    private val updateHistogram = Runnable {
+        val l = view.look ?: return@Runnable
+        val (ow, oh) = edit.outSize(l.src.width, l.src.height)
+        val k = 200f / maxOf(ow, oh)
+        histogram.data = histogram(gpu(maxOf(1, (ow * k).toInt()), maxOf(1, (oh * k).toInt())) { it.scale(k, k); l.draw(it, edit) })
+    }
+
+    private fun lightPanel(): View {
+        histogram = HistogramView(this)
+        val auto = textButton("Auto") {
+            val l = view.look ?: return@textButton
+            checkpoint(); autoTone(l.src).forEach { (k, v) -> edit[k] = v }; refresh()
+        }
+        return column(histogram, buttons(auto), sliders("light"))
+    }
 
     /** Own tab, so the panel never scrolls under a finger that is shaping the curve. */
     private fun curvePanel(): View {
@@ -172,16 +187,35 @@ class MainActivity : Activity() {
             hue = HUES[i] // the three sliders now edit this hue
             mix.forEach { (row, k) -> row.bar.progress = Math.round(edit["$hue$k"] * 100) }
         }
-        return column(sliders("color"), heading("Color mix"), chips, *mix.map { it.first }.toTypedArray())
+        var range = "shadow"
+        val grade = listOf(
+            unit("Hue", { edit["${range}Hue"] }, { edit["${range}Hue"] = it }, register = true, format = degrees),
+            unit("Saturation", { edit["${range}Sat"] }, { edit["${range}Sat"] = it }, register = true, format = percent),
+            slider("Luminance", { "${range}Lum" }))
+        val ranges = listOf("shadow" to "Shadows", "mid" to "Midtones", "high" to "Highlights")
+        val rangeChips = Tabs(this, ranges.map { it.second }) { i ->
+            range = ranges[i].first // the three sliders now grade this range
+            grade[0].bar.progress = Math.round(edit["${range}Hue"] * 200 - 100)
+            grade[1].bar.progress = Math.round(edit["${range}Sat"] * 200 - 100)
+            grade[2].bar.progress = Math.round(edit["${range}Lum"] * 100)
+        }
+        return column(sliders("color"), heading("Color mix"), chips, *mix.map { it.first }.toTypedArray(),
+            heading("Color grading"), rangeChips, *grade.toTypedArray(),
+            slider("blending", { "blending" }), slider("balance", { "balance" }))
     }
 
     private fun cropPanel(): View {
-        val straighten = slider("Straighten", { "straighten" }) {
-            view.look?.let { val (ow, oh) = edit.oriented(it.src.width, it.src.height); edit.crop = edit.shrinkToFit(edit.crop, ow, oh) }
+        val refit = { view.look?.let { val (ow, oh) = edit.oriented(it.src.width, it.src.height); edit.crop = edit.shrinkToFit(edit.crop, ow, oh) } }
+        val straighten = slider("Straighten", { "straighten" }) { refit() }
+        val vertical = slider("vertical", { "vertical" }) { refit() }
+        val horizontal = slider("horizontal", { "horizontal" }) { refit() }
+        val level = textButton("Level") { // straighten from the photo's own lines
+            val l = view.look ?: return@textButton
+            checkpoint(); edit["straighten"] = autoLevel(bake(l.base, emptyList())); refit(); refresh()
         }
         val aspects = listOf("Free" to 0f, "Original" to -1f, "1:1" to 1f, "4:5" to 0.8f, "16:9" to 16f / 9)
         val chips = Tabs(this, aspects.map { it.first }) { i -> aspect(aspects[i].second) }
-        return column(chips, straighten, buttons(
+        return column(chips, straighten, vertical, horizontal, buttons(level,
             textButton("Rotate") { checkpoint(); edit.rotateRight(); view.aspect = view.aspect?.let { 1 / it }; refresh() },
             textButton("Flip") { checkpoint(); edit.flip(); refresh() },
             textButton("Reset crop") {
@@ -297,9 +331,53 @@ class MainActivity : Activity() {
         delete = textButton("Delete spot") {
             edit.retouch.getOrNull(view.spot)?.let { s -> checkpoint(); edit.retouch = edit.retouch - s; view.spot = -1; view.onSpot(); changed() }
         }.apply { isEnabled = false }
+        val find = textButton("Find spots") {
+            val l = view.look ?: return@textButton
+            toast("Looking for dust and blemishes…")
+            Thread {
+                val found = findSpots(l.base)
+                runOnUiThread {
+                    if (found.isEmpty()) return@runOnUiThread toast("No spots found")
+                    checkpoint(); edit.retouch = edit.retouch + found; changed(); toast("Fixed ${found.size} spot" + if (found.size > 1) "s" else "")
+                }
+            }.start()
+        }
         val clear = textButton("Clear all") { if (edit.retouch.isNotEmpty()) { checkpoint(); edit.retouch = emptyList(); view.spot = -1; view.onSpot(); changed() } }
         sync += { if (view.spot >= edit.retouch.size) { view.spot = -1; view.onSpot() } }
-        return column(hint("Tap a spot to fix it. Drag the dashed circle to choose what it copies from."), mode, size, buttons(delete, clear))
+        return column(hint("Tap a spot to fix it. Drag the dashed circle to choose what it copies from."), mode, size, buttons(find, delete, clear))
+    }
+
+    private var rebuildPresets: () -> Unit = {}
+    private var rebuildProfiles: () -> Unit = {}
+    private var rebuildVersions: () -> Unit = {}
+
+    /** Text prompt with a default. */
+    private fun ask(title: String, default: String, done: (String) -> Unit) {
+        val input = EditText(this).apply { setText(default); selectAll() }
+        AlertDialog.Builder(this).setTitle(title).setView(input)
+            .setPositiveButton("Save") { _, _ -> input.text.toString().trim().takeIf { it.isNotEmpty() }?.let(done) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    /** Opens the system file picker: 2 = a .cube LUT, 3 = an .xmp preset. */
+    private fun pick(code: Int) = startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), code)
+
+    @Deprecated("plain Activity, no AndroidX")
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        val uri = data?.data ?: return
+        if (res != RESULT_OK) return
+        val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { if (it.moveToFirst()) it.getString(0) else null }?.substringBeforeLast('.') ?: "Imported"
+        val text = runCatching {
+            contentResolver.openInputStream(uri)!!.use { s -> s.readNBytes(8 shl 20).toString(Charsets.UTF_8) } // 8 MB is plenty for a LUT
+        }.getOrElse { return toast("Couldn't read that file") }
+        when (req) {
+            2 -> runCatching { Profiles.importCube(name, text) }
+                .onSuccess { rebuildProfiles(); toast("Profile \"$name\" added") }
+                .onFailure { toast("Not a 3D .cube LUT: ${it.message}") }
+            3 -> xmpPreset(text, name)?.let { (n, json) -> db.savePreset(n, json); rebuildPresets(); toast("Preset \"$n\" added") }
+                ?: toast("No settings Lumen understands in that file")
+        }
     }
 
     private fun presetsPanel(): View {
@@ -319,18 +397,54 @@ class MainActivity : Activity() {
                 }, LayoutParams(LayoutParams.MATCH_PARENT, Ui.size("touch")))
             }
         }
-        val save = textButton("Save as preset") {
-            val input = EditText(this).apply { setText("My look ${db.presets().size + 1}"); selectAll() }
-            AlertDialog.Builder(this).setTitle("Preset name").setView(input)
-                .setPositiveButton("Save") { _, _ ->
-                    input.text.toString().trim().takeIf { it.isNotEmpty() }?.let { db.savePreset(it, edit.toJson(whole = false)); build() }
-                }.setNegativeButton("Cancel", null).show()
-        }
+        val save = textButton("Save as preset") { ask("Preset name", "My look ${db.presets().size + 1}") { db.savePreset(it, edit.toJson(whole = false)); build() } }
         val copy = textButton("Copy edits") { Clip.edit = edit.toJson(whole = false); pasteBtn.isEnabled = true; toast("Edits copied") }
         pasteBtn = textButton("Paste edits") { Clip.edit?.let { checkpoint(); edit.merge(it, whole = false); refresh() } }
             .apply { isEnabled = Clip.edit != null }
         build()
-        return column(buttons(save, copy, pasteBtn), heading("Presets"), list)
+        rebuildPresets = ::build
+
+        // Profiles: the base look, applied before the tone curve
+        val profileHost = FrameLayout(this)
+        lateinit var buildProfiles: () -> Unit
+        val amount = unit("Amount", { edit.profileAmount }, { edit.profileAmount = it }, register = true, format = percent)
+        buildProfiles = {
+            profileHost.removeAllViews()
+            val names = Profiles.names()
+            profileHost.addView(Tabs(this, names, initial = names.indexOf(edit.profile).coerceAtLeast(0)) { i ->
+                if (edit.profile != names[i]) { checkpoint(); edit.profile = names[i]; changed() }
+            })
+        }
+        rebuildProfiles = buildProfiles
+        buildProfiles()
+        sync += { buildProfiles() }
+
+        // Versions: named snapshots of this photo's edit
+        val versionList = column()
+        fun buildVersions() {
+            versionList.removeAllViews()
+            val r = row ?: return
+            db.versions(r.id).forEach { v ->
+                versionList.addView(textButton(v.name) { checkpoint(); view.edit = Edit().merge(v.edit); refresh() }.apply {
+                    gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                    setPadding(Ui.space(4), 0, Ui.space(4), 0)
+                    contentDescription = "Go back to version ${v.name}. Long press to delete."
+                    setOnLongClickListener {
+                        AlertDialog.Builder(context).setMessage("Delete the version \"${v.name}\"?")
+                            .setPositiveButton("Delete") { _, _ -> db.deleteVersion(v.id); buildVersions() }.setNegativeButton("Keep", null).show(); true
+                    }
+                }, LayoutParams(LayoutParams.MATCH_PARENT, Ui.size("touch")))
+            }
+        }
+        rebuildVersions = ::buildVersions
+        val saveVersion = textButton("Save version") {
+            val r = row ?: return@textButton
+            ask("Version name", "Version ${db.versions(r.id).size + 1}") { db.saveVersion(r.id, it, edit.toJson()); buildVersions() }
+        }
+        return column(heading("Profile"), profileHost, amount,
+            buttons(textButton("Import LUT…") { pick(2) }, textButton("Import preset…") { pick(3) }),
+            heading("Presets"), buttons(save, copy, pasteBtn), list,
+            heading("Versions"), buttons(saveVersion), versionList)
     }
 
     private fun ratePanel(): View {
@@ -353,7 +467,22 @@ class MainActivity : Activity() {
             }
             if (r != null) { flagTabs.select(flags.indexOfFirst { it.first == r.flag }); labelTabs.select(LABELS.indexOf(r.label)) }
         }
-        return column(heading("Rating"), buttons(*stars.toTypedArray()), heading("Flag"), flagTabs, heading("Label"), labelTabs)
+        val albumList = column()
+        fun buildAlbums() {
+            albumList.removeAllViews()
+            val r = row ?: return
+            val mine = db.albumsOf(r.id)
+            db.albums().forEach { a ->
+                albumList.addView(toggle(a.name, a.id in mine) { c -> db.setInAlbum(a.id, r.id, c) })
+            }
+        }
+        syncMarks += { buildAlbums() }
+        val newAlbum = textButton("New album") {
+            val r = row ?: return@textButton
+            ask("Album name", "Album ${db.albums().size + 1}") { db.setInAlbum(db.createAlbum(it), r.id, true); buildAlbums() }
+        }
+        return column(heading("Rating"), buttons(*stars.toTypedArray()), heading("Flag"), flagTabs, heading("Label"), labelTabs,
+            heading("Albums"), albumList, buttons(newAlbum))
     }
 
     private fun rate(n: Int) = mark("rating", n)
@@ -370,7 +499,11 @@ class MainActivity : Activity() {
 
     // ---- history ----
 
-    private fun changed() { view.invalidate(); ui.removeCallbacks(saveEdit); ui.postDelayed(saveEdit, 300) } // autosave, debounced
+    private fun changed() { // autosave and histogram, debounced
+        view.invalidate()
+        ui.removeCallbacks(saveEdit); ui.postDelayed(saveEdit, 300)
+        if (::histogram.isInitialized) { ui.removeCallbacks(updateHistogram); ui.postDelayed(updateHistogram, 250) }
+    }
 
     private fun checkpoint() {
         undo.addLast(edit.copy())
@@ -422,19 +555,6 @@ class MainActivity : Activity() {
         finish()
     }
 
-    /** Decoded in sRGB (P3 photos convert once, up front), scaled by `scale(full size)` if below 1. Returns the full size too. */
-    private fun decode(uri: Uri, scale: (Size) -> Float): Pair<Bitmap, Size> {
-        var size = Size(1, 1)
-        val b = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { d, info, _ ->
-            size = info.size
-            d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            d.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.SRGB))
-            val k = scale(info.size)
-            if (k < 1) d.setTargetSize((info.size.width * k).toInt().coerceAtLeast(1), (info.size.height * k).toInt().coerceAtLeast(1))
-        }
-        return b to size
-    }
-
     private fun load(uri: Uri) = Thread {
         val result = runCatching {
             val (bmp, size) = decode(uri) { 2048f / maxOf(it.width, it.height) } // preview: the shader runs per screen pixel, 2048 is plenty
@@ -450,23 +570,22 @@ class MainActivity : Activity() {
             undo.clear(); redo.clear()
             refresh()
             syncMarks.forEach { it() }
+            rebuildVersions()
         }
     }.start()
 
     private fun keyOf(uri: Uri): String = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
         ?.use { if (it.moveToFirst()) key(it.getString(0), it.getLong(1), uri) else null } ?: uri.toString()
 
-    private class ExportOptions(val format: String, val long: Int, val quality: Int, val meta: Boolean)
-
     /** S08: format, size, quality, metadata; Export saves to Pictures/Lumen, Share also hands it to another app. */
+    /** S08: format, size, quality, metadata, watermark; Export saves to Pictures/Lumen, Share also hands it to another app. */
     private fun exportDialog() {
         if (source == null) return toast("Open a photo first")
-        val prefs = getSharedPreferences("export", MODE_PRIVATE) // remembered between exports
+        val o = ExportOptions.saved(this) // remembered between exports
         val formats = listOf("JPEG", "PNG", "WebP")
         val sizes = listOf(0 to "Full size", 4096 to "4096 px", 2048 to "2048 px", 1080 to "1080 px")
-        var format = prefs.getString("format", "JPEG")!!; var long = prefs.getInt("long", 0)
-        var quality = prefs.getInt("quality", 92); var meta = prefs.getBoolean("meta", true)
-        val qLabel = Ui.type(TextView(this), "sm").apply { setPadding(Ui.space(4), 0, Ui.space(4), 0) }
+        var format = o.format; var long = o.long; var quality = o.quality; var meta = o.meta; var location = o.location
+        val qLabel = Ui.type(TextView(this), "sm").apply { setPadding(Ui.space(4), Ui.space(4), Ui.space(4), 0); text = "Quality  $quality" }
         val q = SeekBar(this).apply {
             min = 50; max = 100; progress = quality
             thumbTintList = android.content.res.ColorStateList.valueOf(Ui.color("accent"))
@@ -478,76 +597,41 @@ class MainActivity : Activity() {
                 override fun onStopTrackingTouch(s: SeekBar) {}
             })
         }
-        qLabel.text = "Quality  $quality"
-        val metaSwitch = Switch(this).apply {
-            text = "Keep date, camera and lens info"; isChecked = meta; setOnCheckedChangeListener { _, c -> meta = c }
-            Ui.type(this, "sm"); setPadding(Ui.space(4), Ui.space(2), Ui.space(4), 0); minHeight = Ui.size("touch")
-            val on = intArrayOf(android.R.attr.state_checked)
-            thumbTintList = android.content.res.ColorStateList(arrayOf(on, intArrayOf()), intArrayOf(Ui.color("accent"), Ui.color("text-muted")))
-            trackTintList = android.content.res.ColorStateList(arrayOf(on, intArrayOf()), intArrayOf(Ui.color("accent"), Ui.color("border")))
+        val mark = EditText(this).apply {
+            hint = "Watermark text (optional)"; setText(o.watermark); Ui.type(this, "sm"); setHintTextColor(Ui.color("text-muted"))
         }
         val body = column(
             heading("Format"), Tabs(this, formats, initial = formats.indexOf(format)) { format = formats[it]; q.isEnabled = format != "PNG" },
             heading("Long edge"), Tabs(this, sizes.map { it.second }, initial = sizes.indexOfFirst { it.first == long }) { long = sizes[it].first },
-            qLabel.apply { setPadding(Ui.space(4), Ui.space(4), Ui.space(4), 0) }, q, metaSwitch).apply { setBackgroundColor(Ui.color("surface")) }
+            qLabel, q,
+            toggle("Keep date, camera and lens info", meta) { meta = it },
+            toggle("Keep location", location) { on ->
+                location = on // MediaStore only reveals GPS to apps holding this permission; ask the moment it is wanted
+                if (on && checkSelfPermission(android.Manifest.permission.ACCESS_MEDIA_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                    requestPermissions(arrayOf(android.Manifest.permission.ACCESS_MEDIA_LOCATION), 4)
+            },
+            FrameLayout(this).apply { setPadding(Ui.space(4), 0, Ui.space(4), 0); addView(mark) },
+        ).apply { setBackgroundColor(Ui.color("surface")) }
         fun go(share: Boolean) {
-            prefs.edit().putString("format", format).putInt("long", long).putInt("quality", quality).putBoolean("meta", meta).apply()
-            export(ExportOptions(format, long, quality, meta), share)
+            val opts = ExportOptions(format, long, quality, meta, location, mark.text.toString().trim()).also { it.save(this) }
+            val uri = source ?: return
+            val e = edit.copy()
+            toast("Exporting…")
+            Thread {
+                val out = exportPhoto(uri, e, opts)
+                runOnUiThread {
+                    if (out == null) return@runOnUiThread toast("Export failed")
+                    toast("Exported ${out.second.width}×${out.second.height} $format to Pictures/Lumen")
+                    if (share) startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType(contentResolver.getType(out.first))
+                        .putExtra(Intent.EXTRA_STREAM, out.first).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "Share photo"))
+                }
+            }.start()
         }
         AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(body) })
             .setPositiveButton("Export") { _, _ -> go(false) }
             .setNeutralButton("Share") { _, _ -> go(true) }
             .setNegativeButton("Cancel", null).show()
             .apply { listOf(-1, -2, -3).forEach { getButton(it)?.setTextColor(Ui.color("accent")) } } // positive, negative, neutral
-    }
-
-    private fun export(o: ExportOptions, share: Boolean) {
-        val uri = source ?: return
-        val e = edit.copy()
-        toast("Exporting…")
-        Thread {
-            // ponytail: requested size first, 4096 px if memory runs out (8 bytes/px: decode + output)
-            val out = listOf(o.long.takeIf { it > 0 } ?: Int.MAX_VALUE, 4096).distinct().firstNotNullOfOrNull { target ->
-                runCatching {
-                    Look(decode(uri) { s -> e.outSize(s.width, s.height).let { (w, h) -> target.toFloat() / maxOf(w, h) } }.first).render(e)
-                }.onFailure { Log.w("Lumen", "export at $target", it) }.getOrNull()
-            }
-            val (mime, ext, fmt) = when (o.format) {
-                "PNG" -> Triple("image/png", "png", Bitmap.CompressFormat.PNG)
-                "WebP" -> Triple("image/webp", "webp", Bitmap.CompressFormat.WEBP_LOSSY)
-                else -> Triple("image/jpeg", "jpg", Bitmap.CompressFormat.JPEG)
-            }
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "Lumen_${System.currentTimeMillis()}.$ext")
-                put(MediaStore.Images.Media.MIME_TYPE, mime)
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Lumen")
-                put(MediaStore.Images.Media.IS_PENDING, 1) // hidden from other apps until EXIF is written
-            }
-            val dest = if (out != null) contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) else null
-            val ok = out != null && dest != null && contentResolver.openOutputStream(dest)?.use { out.compress(fmt, o.quality, it) } == true
-            if (ok && o.meta) runCatching { copyExif(uri, dest!!) }.onFailure { Log.w("Lumen", "exif", it) } // metadata is best effort
-            if (dest != null) contentResolver.update(dest, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
-            runOnUiThread {
-                if (!ok) return@runOnUiThread toast("Export failed")
-                toast("Exported ${out!!.width}×${out.height} ${o.format} to Pictures/Lumen")
-                if (share) startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType(mime)
-                    .putExtra(Intent.EXTRA_STREAM, dest).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "Share photo"))
-            }
-        }.start()
-    }
-
-    /** Camera and date metadata survive export. Orientation is baked into the pixels, so it resets to normal. */
-    private fun copyExif(from: Uri, to: Uri) {
-        val src = contentResolver.openInputStream(from)?.use { ExifInterface(it) }
-        contentResolver.openFileDescriptor(to, "rw")!!.use { fd ->
-            ExifInterface(fd.fileDescriptor).apply {
-                // ponytail: no GPS. MediaStore redacts location unless ACCESS_MEDIA_LOCATION is granted; add both if exports should keep it
-                EXIF_TAGS.forEach { t -> src?.getAttribute(t)?.let { setAttribute(t, it) } }
-                setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
-                setAttribute(ExifInterface.TAG_SOFTWARE, "Lumen")
-                saveAttributes()
-            }
-        }
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
@@ -605,7 +689,52 @@ class MainActivity : Activity() {
         val healed = bake(dotted, listOf(Spot(0.5f, 0.5f, 0.2f, 0.2f, 0.08f, heal = true)))
         checks["heal"] = Color.red(healed.getPixel(32, 32)) in 95..105 && Color.red(dotted.getPixel(32, 32)) == 0
 
+        // profiles, LUTs and imported presets
+        Profiles.init(this)
+        val mono = Look(solid(Color.rgb(200, 40, 40))).render(Edit().apply { profile = "Mono" }).getPixel(0, 0)
+        checks["mono profile"] = abs(Color.red(mono) - Color.blue(mono)) < 6
+        val cube = Profiles.parseCube("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n")
+        checks["cube parse"] = cube.width == 4 && cube.height == 2 && cube.getPixel(3, 0) == Color.rgb(255, 0, 255) && cube.getPixel(1, 1) == Color.rgb(255, 255, 0)
+        val xmp = xmpPreset("""<x:xmpmeta><rdf:Description crs:Exposure2012="+1.00" crs:Contrast2012="+20" crs:HueAdjustmentRed="-10">
+            <crs:Name><rdf:Alt><rdf:li xml:lang="x-default">Sunny</rdf:li></rdf:Alt></crs:Name>
+            <crs:ToneCurvePV2012><rdf:Seq><rdf:li>0, 20</rdf:li><rdf:li>255, 240</rdf:li></rdf:Seq></crs:ToneCurvePV2012></rdf:Description></x:xmpmeta>""", "file")
+        val xe = xmp?.let { Edit().merge(it.second, whole = false) }
+        checks["xmp preset"] = xmp?.first == "Sunny" && xe != null && abs(xe["exposure"] - 0.5f) < 1e-4f && abs(xe["contrast"] - 0.2f) < 1e-4f &&
+            abs(xe["redHue"] + 0.1f) < 1e-4f && abs(xe.curves[0][0].second - 20 / 255f) < 1e-4f && xe["saturation"] == 0f
+
+        // geometry: keystone needs a smaller crop, like straighten
+        val ks = Edit().apply { this["vertical"] = 0.6f }
+        // keystone stretches outward, so the full frame stays covered and the top corners move out
+        val corner = floatArrayOf(0f, 0f).also { ks.shape(300, 200).mapPoints(it) }
+        checks["perspective"] = ks.fits(RectF(0f, 0f, 1f, 1f), 300, 200) && corner[0] < -10f && abs(corner[1]) < 1e-3f
+
+        // grading tints the shadows; grain and noise reduction change texture as asked
+        val graded = px(solid(Color.rgb(50, 50, 50)), "shadowHue" to 0f, "shadowSat" to 1f)
+        checks["grading"] = Color.red(graded) > Color.blue(graded) + 8
+        fun spread(b: Bitmap) = IntArray(b.width * b.height).also { b.getPixels(it, 0, b.width, 0, 0, b.width, b.height) }.map { Color.green(it).toDouble() }
+            .let { v -> val m = v.average(); kotlin.math.sqrt(v.sumOf { (it - m) * (it - m) } / v.size) } // standard deviation
+        checks["grain"] = spread(Look(flat).render(Edit().apply { this["grain"] = 1f })) > 2 && spread(Look(flat).render(Edit())) < 0.5
+        val rnd = java.util.Random(7)
+        val noisy = Bitmap.createBitmap(IntArray(64 * 64) { val v = 100 + rnd.nextInt(41) - 20; Color.rgb(v, v, v) }, 64, 64, Bitmap.Config.ARGB_8888)
+        checks["noise reduction"] = spread(Look(noisy).render(Edit().apply { this["noise"] = 1f })) < spread(Look(noisy).render(Edit()))
+
+        // auto tone, level, spot finding
+        checks["auto tone"] = (autoTone(solid(Color.rgb(30, 30, 30)))["exposure"] ?: 0f) > 0.3f
+        val tilted = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.WHITE)
+            val c = android.graphics.Canvas(this); c.rotate(5f, 100f, 100f)
+            val ink = android.graphics.Paint().apply { color = Color.BLACK; strokeWidth = 3f }
+            for (y in -100..300 step 20) c.drawLine(-100f, y.toFloat(), 300f, y.toFloat(), ink)
+        }
+        val level = autoLevel(tilted)
+        checks["auto level"] = abs(level + 5f / 45f) < 0.03f
+        val specked = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(Color.rgb(150, 150, 150)); for (x in 98..101) for (y in 98..101) setPixel(x, y, Color.rgb(60, 60, 60))
+        }
+        checks["find spots"] = findSpots(specked).let { it.size == 1 && abs(it[0].dx - 0.5f) < 0.02f && abs(it[0].dy - 0.5f) < 0.02f }
+
         val j = Edit().apply {
+            profile = "Film"; profileAmount = 0.7f; this["vertical"] = 0.1f; this["grain"] = 0.3f; this["shadowHue"] = 0.6f
             this["clarity"] = 0.2f; curves = listOf(listOf(0f to 0.1f, 1f to 0.9f), LINE, LINE, LINE); rotateRight()
             masks = listOf(Mask("brush").apply { adj[2] = -0.5f; strokes = listOf(Stroke(floatArrayOf(0.1f, 0.1f, 0.3f, 0.4f), 0.05f, false)) })
             retouch = listOf(Spot(0.5f, 0.5f, 0.6f, 0.5f, 0.02f, heal = false))
